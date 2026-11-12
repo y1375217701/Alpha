@@ -114,7 +114,7 @@ Alpha 是一个面向 A 股市场的**自进化量化选股系统**。它不只�
 |------|------|------|
 | **启动回填** | 一次性 | 补齐缺失的股票名称并刷新本地 symbol name cache |
 | **Ticker Loop** | 60s | 调用 `FunnelService.tick()` 刷新漏斗评分，变更时 WebSocket 广播快照 |
-| **K线同步 Loop** | 每日 15:20 | 自动检测是否需要同步，仅补最新交易日缺口，进度写入数据中心 |
+| **K线同步 Loop** | 每日 15:20，配置智兔或扶摇时 17:15 | 自动检测是否需要同步，仅补最新交易日缺口，进度写入数据中心 |
 | **分钟线 Loop** | 60s | 交易时段仅为买入池标的同步 1 分钟 K 线，非交易时段空转 |
 | **Hermes 调度 Loop** | 300s | 15:30 盘后复盘 · 21:00 公告复盘 |
 | **智能监控 Loop** | 30s | 盘中按配置间隔（5~30min）执行 LLM 监控 tick，结果 WebSocket 推送 |
@@ -147,26 +147,29 @@ Alpha 是一个面向 A 股市场的**自进化量化选股系统**。它不只�
 - **同步操作**：全量补缺（日期×股票交叉补全）· 增量同步（日期范围一次提交批量队列）· 完整性检查
 - **任务历史**：分页展示，支持按状态筛选（全部/成功/失败/运行中）
 - **完整性报告**：按日期展示缺失分布，最差个股排名
-- **自动同步**：每日 15:20 自动补最新交易日缺口；配置 Token 时以 Tushare 提供股票主数据、交易日历和日线，未配置或调用失败时显式降级东财 / 新浪；实时行情固定走东财，历史全量补缺仅由手动按钮触发
+- **自动同步**：每日 15:20 自动补最新交易日缺口。配置智兔或扶摇后，于 17:15 检查日线缺口。历史全量补缺由数据中心手动触发
 - **数据增强**：日线封账后按交易日增量同步估值/换手/量比/市值、涨跌停价、复权因子、个股资金流、北向资金和 4 个基准指数；盘中每分钟同步买入池分钟线（仅买入池，不做全市场实时）
 - **增强覆盖面板**：数据中心展示每类增强数据的最新日期、行数与同步状态，失败数据集独立标记，不影响主 K 线封账
-- **来源可追溯**：K 线与同步明细持久化 `source` / `fallback_reason`，可区分 `tushare`、`eastmoney`、`sina`、`sqlite` 与具体降级原因
+- **来源可追溯**：K 线与同步明细持久化 `source` / `fallback_reason`，可区分 `zhitu`、`fuyao`、`tushare`、`eastmoney`、`sina`、`sqlite` 与具体降级原因
 
 ### 数据源与格式
 
 | 场景 | 主源 | 降级源 | Alpha 内部格式 |
 |------|------|--------|----------------|
-| 股票主数据 | Tushare `stock_basic` | 东方财富全市场 spot | `symbol -> name`，股票代码统一为 6 位字符串 |
-| 交易日历 | Tushare `trade_cal` | Sina，最后使用新鲜 SQLite 日期 | `YYYY-MM-DD` |
-| 历史/日线 | Tushare `daily` / `pro_bar` | 东方财富 K 线 | SQLite：`symbol, trade_date, open, high, low, close, volume, amount, source, fallback_reason` |
+| 股票主数据 | 智兔沪深、北交所股票列表 | Tushare `stock_basic` / 东方财富全市场 spot | `symbol -> name`，股票代码统一为 6 位字符串 |
+| 实时行情 | 智兔全市场快照 | 东方财富 / 新浪 / SQLite | 快照带行情日期，供增量同步校验 |
+| 交易日历 | 扶摇近一年交易日 | Tushare `trade_cal` / 新浪 / 新鲜 SQLite 日期 | `YYYY-MM-DD` |
+| 历史/日线 | 扶摇全市场 Parquet、智兔单股日线 | Tushare `daily` / `pro_bar` / 东方财富 K 线 | SQLite：`symbol, trade_date, open, high, low, close, volume, amount, source, fallback_reason` |
 | 日频增强 | Tushare `daily_basic` / `stk_limit` / `adj_factor` | — | SQLite `kline_daily_extras`：估值、换手、量比、市值、涨跌停价、复权因子 |
 | 个股资金流 | Tushare `moneyflow` | — | SQLite `moneyflow_daily`：小/中/大/超大单买卖额与净流入 |
 | 北向资金 | Tushare `moneyflow_hsgt` | — | SQLite `market_capital_flow`：沪股通、深股通、北向/南向合计 |
-| 基准指数 | Tushare `index_daily` | — | SQLite `index_daily`：上证/深证/创业板/沪深300 |
+| 基准指数 | 扶摇批量指数日线 | Tushare `index_daily` | SQLite `index_daily`：上证/深证/创业板/沪深300 |
 | 分钟线 | Tushare `rt_min` | Tushare `realtime_quote` 单点兜底 | SQLite `kline_minute`：仅买入池，1 分钟 bar |
 | 实时行情 | 东方财富 spot | 业务层既有降级路径 | Pandas DataFrame 中文列名；FastAPI 对外返回 JSON |
 
 Tushare `daily.vol` 以“手”为单位，直接映射为 `volume`；`daily.amount` 以“千元”为单位，写入 Alpha 前乘以 1000，统一为人民币“元”。`daily_basic.total_mv/circ_mv` 与资金流字段以“万元”为单位，写入前乘以 10000。`rt_min` 直接返回股数与人民币。策略产物仍按各模块使用 CSV / JSON，Kronos 输入使用英文 OHLCVA DataFrame。
+
+扶摇全市场日线按未复权口径提供，成交量从股换成手，成交额以元入库。手动历史回填需要前复权时，有除权除息事件的标的走智兔或既有单股前复权接口。扶摇复权事件用于判断何时走单股接口。全市场历史估值、日频复权因子、资金流和买入池分钟线沿用既有 Tushare 能力。
 
 ### 3. 策略选股
 
@@ -494,7 +497,7 @@ K 线同步完成类消息只写入服务日志，`notify_sync_complete()` 在�
 | **预测模型** | [Kronos-base](https://huggingface.co/NeoQuasar/Kronos-base) 102.3M · PyTorch · HuggingFace Hub |
 | **策略建模** | FirstLimit Alpha · LightGBM · scikit-learn · GRU |
 | **智能体** | Hermes Agent（CLI `hermes chat -q` / HTTP API）· MCP 协议 · OpenAI 兼容 LLM |
-| **数据源** | Tushare Pro（股票主数据 / 交易日历 / 日线 / 估值 / 涨跌停 / 复权 / 资金流 / 北向 / 指数 / 分钟线）· 东财 async HTTP（实时行情与降级 K 线）· 新浪（交易日历降级）· AkShare / 同花顺（公告、概念等业务路径） |
+| **数据源** | 智兔（股票列表、快照、个股日线）· 扶摇（交易日历、全市场日线 Parquet、基准指数）· Tushare Pro（既有增强数据与降级）· 东方财富 / 新浪 / AkShare（行情降级、公告、概念等） |
 | **存储** | SQLite × 3：`market_kline.db`（K 线与增强数据）+ `funnel_state.db`（漏斗/公告/持仓/Agent 记忆）+ `jobs.db`（长任务状态），均带 `PRAGMA user_version` 启动迁移 |
 | **前端** | 原生 HTML/CSS/JS（无构建 classic modules）· ECharts 5 · CSP · Glassmorphism 暗色主题 · WebSocket 实时推送 |
 | **通知** | 飞书 Webhook **交互式卡片**（K 线同步 / 预测选股 / 周报） |
@@ -546,7 +549,8 @@ Alpha/
 │       ├── kline_cache_service.py     # K 线并发同步调度 + 日频增强/买入池分钟线
 │       ├── kline_store.py             # K 线 + 增强数据 SQLite 存储
 │       ├── market_data_client.py      # 东财/新浪 async HTTP 客户端（硬超时·有限重试）
-│       ├── tushare_market_data_client.py # Tushare 主源 + 显式东财/新浪降级与格式规范化
+│       ├── market_data_sources.py      # 智兔 REST 与扶摇 REST / Parquet 解析
+│       ├── tushare_market_data_client.py # 行情来源选择、Tushare 和东财/新浪降级
 │       ├── data_provider.py           # 多数据源适配（同花顺/新浪/AkShare）
 │       ├── blocking_io.py             # 外部阻塞调用统一超时、熔断、独立线程池与降级计数
 │       ├── job_store.py               # 通用任务 SQLite 持久化（data/jobs.db）
@@ -646,6 +650,7 @@ docker compose logs -f  # 查看启动日志
 | 全空 | 三池漏斗选股、K线缓存同步、数据中心、模拟盘、Web UI | LLM 公告打分、Hermes 复盘与监控、Tushare 兜底源 |
 | + Ollama（本地免费） | 公告 LLM 打分、Hermes 复盘/监控（降级模式） | — |
 | + Tushare Token | 日线主源 + 日频增强、资金流、北向、基准指数、买入池分钟线 | — |
+| + 智兔 / 扶摇凭据 | 股票列表、实时快照、单股与全市场日线、近一年交易日历、基准指数 | — |
 | + Kronos（首次预测自动下载权重） | 预测选股、单股 K 线预测 | — |
 
 首次使用建议：打开「数据中心」Tab，空库时会出现**一键初始化**引导卡；初始化完成前，「策略选股」「预测选股」页会显示去初始化的引导横幅。
@@ -661,7 +666,9 @@ docker compose logs -f  # 查看启动日志
 | `RELOAD` | `0` | 热重载（开发模式设为 `1`） |
 | `ALPHA_WRITE_TOKEN` | — | 写操作令牌。配置后所有 POST/PUT/DELETE 需携带 `X-Alpha-Token` 头（MCP Server 会自动读取同一变量附加请求头）；留空时写操作仅允许本机回环来源 |
 | `ENABLE_TUSHARE` | `false`（示例文件默认） | 是否启用 Tushare（日线主源与增强数据）；不配置时系统通过东财 / 新浪完整运行 |
-| `TUSHARE_TOKEN` | — | Tushare Pro Token；留空时日线走东财，增强数据同步自动跳过 |
+| `TUSHARE_TOKEN` | — | Tushare Pro Token；留空时由已配置的替代源和东财提供日线，Tushare 专有增强项跳过 |
+| `ZHITU_TOKEN` | — | 智兔 API Token。配置后优先使用智兔股票列表、实时快照和单股日线 |
+| `FUYAO_API_KEY` | — | 扶摇 API Key。配置后优先使用扶摇交易日历、全市场日线和基准指数 |
 | `ENABLE_LIVE_MARKET_DATA` | `true` | 是否允许实时外部行情请求；CI / 离线环境设为 `false` 时快速使用本地缓存 |
 | `PYTHON_BIN` | 自动探测 arm64 Python | 启动服务使用的 Python 可执行文件，必须是 arm64 Python 3.11+；默认优先 `$HOME/arm-python/python/bin/python3.11`、`/opt/homebrew/bin/python3.11` |
 | `OPENAI_API_KEY` | — | 启用 LLM 打分 + 智能监控 + Agent 降级模式 |
@@ -710,7 +717,7 @@ docker compose logs -f  # 查看启动日志
 
 **同步数据保护语义**（重要）：
 
-- **盘中不写当日K线**：目标交易日未收盘定型（上海时间 < 15:05）时，增量/全量同步会跳过当日，避免把未完成行情经 `(symbol, trade_date)` 唯一键永久固化；盘后调度（15:20）自动补上。
+- **盘中不写当日K线**：目标交易日未收盘定型（上海时间 < 15:05）时，增量/全量同步会跳过当日，避免把未完成行情经 `(symbol, trade_date)` 唯一键永久固化。盘后调度在默认 15:20 或智兔/扶摇启用时的 17:15 自动补上。
 - **比例封账**：补缺完成度 ≥ 90% 才写入 `last_success_trade_date`（封账）；未达标记为 `partial` 状态且不封账，次日自动补缺可自愈。同日重试有 30 分钟冷却节流。
 - **报告自动重检**：任何封账成功的同步完成后，服务自动重跑 30 天完整性检查；数据中心对"早于最近同步"的过期报告只显示琥珀色提示，不会拿旧数字误报"严重缺失"。
 - **历史深度**：全量同步 `window_days` 上限 1095 自然日（约 3 年）；一键初始化默认 120 天保证快速冷启动，需要更深历史时手动传大窗口即可。

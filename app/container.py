@@ -12,6 +12,7 @@ import os
 import sqlite3
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import time
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,7 @@ from app.services.custom_strategy import (
     BUILTIN_STRATEGIES,
     CustomStrategyScanner,
 )
-from app.services.data_provider import AkshareDataProvider
+from app.services.data_provider import AkshareDataProvider, _live_market_data_enabled
 from app.services.first_limit_alpha_service import FirstLimitAlphaService
 from app.services.funnel_service import FunnelService
 from app.services.hermes_memory import HermesMemory
@@ -34,6 +35,7 @@ from app.services.kline_store import KlineSQLiteStore
 from app.services.kronos_predict_service import KronosPredictService
 from app.services.limit_board_service import LimitBoardService
 from app.services.market_data_client import EastmoneyMarketDataClient
+from app.services.market_data_sources import FuyaoMarketData, ZhituMarketData
 from app.services.notice_service import NoticeService
 from app.services.observability import BackgroundTaskRegistry
 from app.services.paper_trading import PaperTradingService
@@ -385,9 +387,18 @@ def build_container(data_dir: str | Path | None = None) -> ServiceContainer:
     directory = resolve_data_dir(data_dir)
 
     kline_store = KlineSQLiteStore(str(directory / "market_kline.db"))
-    provider = AkshareDataProvider(kline_store=kline_store)
     eastmoney = EastmoneyMarketDataClient(store=kline_store)
-    market_data_client = TushareFirstMarketDataClient(fallback=eastmoney)
+    zhitu_token = os.getenv("ZHITU_TOKEN", "").strip() if _live_market_data_enabled() else ""
+    fuyao_key = os.getenv("FUYAO_API_KEY", "").strip() if _live_market_data_enabled() else ""
+    market_data_client = TushareFirstMarketDataClient(
+        fallback=eastmoney,
+        zhitu=ZhituMarketData(zhitu_token) if zhitu_token else None,
+        fuyao=FuyaoMarketData(fuyao_key) if fuyao_key else None,
+    )
+    provider = AkshareDataProvider(
+        kline_store=kline_store,
+        market_data_client=market_data_client if zhitu_token or fuyao_key else None,
+    )
     limit_board_service = LimitBoardService(
         store=kline_store, market_data_client=market_data_client
     )
@@ -396,6 +407,7 @@ def build_container(data_dir: str | Path | None = None) -> ServiceContainer:
         store=kline_store,
         market_data_client=market_data_client,
         limit_board_service=limit_board_service,
+        schedule_after=time(17, 15) if zhitu_token or fuyao_key else time(15, 20),
     )
     funnel_service = FunnelService(
         provider=provider,

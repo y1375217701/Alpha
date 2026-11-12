@@ -10,7 +10,7 @@ import pandas as pd
 
 from app.services.data_provider import AkshareDataProvider, to_float
 from app.services.kline_store import KlineSQLiteStore
-from app.services.market_data_client import EastmoneyMarketDataClient
+from app.services.market_data_client import EastmoneyMarketDataClient, _normalize_symbol
 from app.services.time_utils import now_cn, parse_cn_datetime
 
 
@@ -729,24 +729,17 @@ class KlineCacheService:
         latest_trade_date = await self._resolve_latest_trade_date(
             now_cn().date().isoformat()
         )
+        batch_fetchers = []
         if target_trade_date == latest_trade_date:
-            batch_result = await self._batch_fill_from_spot(
-                symbols=missing_symbols,
-                trade_date=target_trade_date,
-                task_id=task_id,
-                target_trade_date=target_trade_date,
-                state=state,
-                trigger_mode=trigger_mode,
-                total=total,
-            )
-            completed += batch_result["completed"]
-            success_count += batch_result["success_count"]
-            fallback_symbols = batch_result["remaining_symbols"]
-
-        if fallback_symbols and hasattr(
-            self.market_data_client, "fetch_daily_by_trade_date"
-        ):
-            batch_result = await self._batch_fill_from_market_daily(
+            batch_fetchers.append(self._batch_fill_from_spot)
+        if hasattr(self.market_data_client, "fetch_daily_by_trade_date"):
+            batch_fetchers.append(self._batch_fill_from_market_daily)
+        if getattr(self.market_data_client, "fuyao", None):
+            batch_fetchers.reverse()
+        for fetch in batch_fetchers:
+            if not fallback_symbols:
+                break
+            batch_result = await fetch(
                 symbols=fallback_symbols,
                 trade_date=target_trade_date,
                 task_id=task_id,
@@ -857,7 +850,8 @@ class KlineCacheService:
             print(f"[kline-cache] limit board sync failed: {type(exc).__name__}")
 
     async def _retry_pending_enrichment(self, trade_date: str) -> None:
-        if not getattr(self.market_data_client, "is_ready", False):
+        tushare_ready = getattr(self.market_data_client, "is_ready", False)
+        if not tushare_ready and not getattr(self.market_data_client, "fuyao", None):
             return
         try:
             overview = await asyncio.to_thread(self.store.get_enrichment_overview)
@@ -868,6 +862,7 @@ class KlineCacheService:
             item["dataset"]
             for item in overview
             if item["dataset"] != "minute"
+            and (tushare_ready or item["dataset"] == "index_daily")
             and not self._dataset_satisfied(item, trade_date)
         ]
         if pending:
@@ -903,7 +898,8 @@ class KlineCacheService:
         try:
             frame = await fetch()
             if frame is None or frame.empty:
-                raise RuntimeError("tushare_empty_response")
+                reason = frame.attrs.get("fallback_reason") if frame is not None else ""
+                raise RuntimeError(reason or "empty_response")
             rows = await asyncio.to_thread(
                 store_method, frame.to_dict("records"), updated_at
             )
@@ -946,6 +942,20 @@ class KlineCacheService:
                 "trade_date": target,
             }
         if not getattr(self.market_data_client, "is_ready", False):
+            if getattr(self.market_data_client, "fuyao", None):
+                index = await self._run_enrichment_dataset(
+                    "index_daily",
+                    lambda: self.market_data_client.fetch_index_daily(target),
+                    self.store.upsert_index_daily,
+                    target,
+                    now_cn().isoformat(),
+                )
+                return {
+                    "success": index["status"] == "success",
+                    "trade_date": target,
+                    "trigger_mode": trigger_mode,
+                    "datasets": [index],
+                }
             return {
                 "success": False,
                 "message": "Tushare 未配置，跳过增强数据同步",
@@ -1222,7 +1232,7 @@ class KlineCacheService:
             symbol_count=completed,
             total_symbols=total,
             trigger_mode=trigger_mode,
-            message=f"Tushare 日线批量补缺 {completed}/{total}",
+            message=f"{source} 日线批量补缺 {completed}/{total}",
         )
         remaining = [s for s in symbols if s not in valid_symbols]
         return {
@@ -1241,19 +1251,24 @@ class KlineCacheService:
         state: dict,
         trigger_mode: str,
         total: int,
+        initial_completed: int = 0,
+        initial_success_count: int = 0,
     ) -> dict[str, Any]:
         t0 = pytime.time()
         wanted = set(symbols)
+        no_rows = {"completed": initial_completed, "success_count": initial_success_count, "remaining_symbols": symbols}
         try:
             snapshot = await self.market_data_client.fetch_spot()
         except Exception as exc:
             print(f"[kline-cache] batch spot fetch failed: {exc!r}")
-            return {"completed": 0, "success_count": 0, "remaining_symbols": symbols}
+            return no_rows
         if snapshot is None or snapshot.empty or "代码" not in snapshot.columns:
-            return {"completed": 0, "success_count": 0, "remaining_symbols": symbols}
+            return no_rows
 
         source = str(snapshot.attrs.get("data_source") or "eastmoney")
         fallback_reason = str(snapshot.attrs.get("fallback_reason") or "")
+        if "行情日期" in snapshot.columns:
+            snapshot = snapshot.loc[snapshot["行情日期"].eq(trade_date)]
         rows: list[tuple[str, dict[str, Any]]] = []
         valid_symbols: set[str] = set()
         for _, item in snapshot.iterrows():
@@ -1286,11 +1301,12 @@ class KlineCacheService:
 
         if not rows:
             print("[kline-cache] batch spot returned no usable kline rows")
-            return {"completed": 0, "success_count": 0, "remaining_symbols": symbols}
+            return no_rows
 
         now_iso = now_cn().isoformat()
         elapsed_ms = int((pytime.time() - t0) * 1000)
-        completed = len(valid_symbols)
+        completed = initial_completed + len(valid_symbols)
+        success_count = initial_success_count + len(valid_symbols)
         await asyncio.to_thread(
             self.store.record_sync_batch,
             kline_items=rows,
@@ -1309,8 +1325,8 @@ class KlineCacheService:
             ],
             updated_at=now_iso,
             task_id=task_id,
-            synced_symbols=completed,
-            success_symbols=completed,
+            synced_symbols=success_count,
+            success_symbols=success_count,
             failed_symbols=0,
             attempt_trade_date=target_trade_date,
             success_trade_date=state.get("last_success_trade_date"),
@@ -1326,7 +1342,7 @@ class KlineCacheService:
         )
         return {
             "completed": completed,
-            "success_count": completed,
+            "success_count": success_count,
             "remaining_symbols": remaining,
         }
 
@@ -1350,15 +1366,24 @@ class KlineCacheService:
         completed = initial_completed
         success_count = initial_success_count
         failed_count = initial_failed_count
+        bulk = pd.DataFrame()
+        bulk_indices = {}
+        if start_date != end_date and getattr(self.market_data_client, "fuyao", None):
+            bulk = await self.market_data_client.fetch_market_history(start_date, end_date)
+            if not bulk.empty:
+                bulk_indices = bulk.groupby("代码", sort=False).indices
 
         async def _fetch_one(symbol: str) -> dict[str, Any]:
             error_message = ""
             async with sem:
                 t0 = pytime.time()
                 try:
-                    hist = await self.market_data_client.fetch_hist(
-                        symbol, start_date, end_date, adjust="qfq"
-                    )
+                    if symbol in bulk_indices:
+                        hist = bulk.iloc[bulk_indices[symbol]]
+                    else:
+                        hist = await self.market_data_client.fetch_hist(
+                            symbol, start_date, end_date, adjust="qfq"
+                        )
                 except Exception as exc:
                     hist = pd.DataFrame()
                     error_message = str(exc)[:200]
@@ -1687,6 +1712,7 @@ class KlineCacheService:
                 name_map = {}
 
         for code, name in (name_map or {}).items():
+            code = _normalize_symbol(code)
             if not code or not code.startswith(("00", "30", "60", "68")):
                 continue
             n = str(name or "").upper()
@@ -1696,6 +1722,7 @@ class KlineCacheService:
 
         # 合并 DB 已知 symbol（兜底 + 去除已退市）
         for s in self.store.get_all_symbols():
+            s = _normalize_symbol(s)
             if s and s.startswith(("00", "30", "60", "68")):
                 symbols.add(s)
 

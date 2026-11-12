@@ -34,11 +34,12 @@ class AkshareDataProvider:
     concept_constituents_cache: dict[str, pd.DataFrame] = field(default_factory=dict)
     concept_snapshot_cache: tuple[datetime, pd.DataFrame] | None = None
     realtime_snapshot_cache: tuple[datetime, pd.DataFrame] | None = None
-    realtime_snapshot_source: str = "none"  # em_live / db_fallback / stale_cache / none
+    realtime_snapshot_source: str = "none"  # zhitu_live / em_live / db_fallback / stale_cache / none
     hot_stocks_cache: tuple[datetime, pd.DataFrame] | None = None
     symbol_name_cache: tuple[datetime, dict[str, str]] | None = None
     kline_store: Any = None
     realtime_snapshot_timed_out: bool = False
+    market_data_client: Any = None
 
     def _snapshot_from_db(self) -> pd.DataFrame:
         """从本地 K 线数据库构建类行情快照（仅用于盘后或实时接口不可用时）。"""
@@ -89,6 +90,13 @@ class AkshareDataProvider:
         """
         self.realtime_snapshot_timed_out = False
         try:
+            if self.market_data_client and self.market_data_client.zhitu:
+                spot = await self.market_data_client.fetch_spot()
+                payload = self._normalize_snapshot(spot)
+                if not payload.empty:
+                    payload.attrs.update(spot.attrs)
+                    await self._ensure_names_from_snapshot(payload)
+                    return payload
             df = await run_blocking(
                 ak.stock_zh_a_spot_em,
                 timeout=self._spot_timeout(),
@@ -179,7 +187,9 @@ class AkshareDataProvider:
                     df = await self._fetch_spot_em()
                     if not df.empty:
                         self.realtime_snapshot_cache = (now_cn(), df)
-                        self.realtime_snapshot_source = "em_live"
+                        self.realtime_snapshot_source = (
+                            "zhitu_live" if df.attrs.get("data_source") == "zhitu" else "em_live"
+                        )
                         return df.copy()
                 except Exception as exc:
                     last_exc = exc
@@ -293,6 +303,10 @@ class AkshareDataProvider:
             return pd.DataFrame({"trade_date": db_dates})
         if not _live_market_data_enabled():
             return pd.DataFrame({"trade_date": db_dates}) if db_dates else pd.DataFrame(columns=["trade_date"])
+        if self.market_data_client and self.market_data_client.fuyao:
+            frame = await self.market_data_client.fetch_trade_days(min_days)
+            if not frame.empty:
+                return frame
         try:
             df = await run_blocking(ak.tool_trade_date_hist_sina, name="akshare.tool_trade_date_hist_sina")
             if df is None or df.empty:
@@ -340,6 +354,11 @@ class AkshareDataProvider:
 
         if not _live_market_data_enabled():
             return pd.DataFrame()
+
+        if self.market_data_client and self.market_data_client.zhitu:
+            frame = await self.market_data_client.fetch_hist(symbol, start_date, end_date, adjust)
+            if not frame.empty:
+                return frame
 
         try:
             df = await run_blocking(
@@ -652,7 +671,9 @@ class AkshareDataProvider:
                 if name_map:
                     # _ensure_names_from_snapshot 已经在 _fetch_spot_em 里落盘
                     self.realtime_snapshot_cache = (now, payload)
-                    self.realtime_snapshot_source = "em_live"
+                    self.realtime_snapshot_source = (
+                        "zhitu_live" if payload.attrs.get("data_source") == "zhitu" else "em_live"
+                    )
                     return name_map
             await asyncio.sleep(1.5 * (attempt + 1))
         print("[data_provider] get_symbol_name_map cold-start failed after retries, will retry in background")
@@ -666,6 +687,9 @@ class AkshareDataProvider:
     async def _refresh_names_from_live(self) -> None:
         """后台刷新 symbol 名称映射（DB 命中后异步兜底更新）。"""
         try:
+            if self.market_data_client and self.market_data_client.zhitu:
+                await self._fetch_spot_em()
+                return
             df = await run_blocking(ak.stock_zh_a_spot_em, name="akshare.stock_zh_a_spot_em")
             payload = self._normalize_snapshot(df)
             if payload.empty:

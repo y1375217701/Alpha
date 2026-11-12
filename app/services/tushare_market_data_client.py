@@ -15,6 +15,7 @@ from app.services.blocking_io import (
     run_blocking,
 )
 from app.services.market_data_client import EastmoneyMarketDataClient, _normalize_symbol
+from app.services.market_data_sources import FuyaoMarketData, MarketDataSourceError, ZhituMarketData
 
 try:
     import tushare as _tushare
@@ -43,9 +44,12 @@ def _to_ts_code(symbol: str) -> str:
     clean = _normalize_symbol(symbol)
     if clean.startswith(("6", "68")):
         return f"{clean}.SH"
-    if clean.startswith(("4", "8")):
+    if clean.startswith(("4", "8", "92")):
         return f"{clean}.BJ"
     return f"{clean}.SZ"
+
+
+_BENCHMARK_CODES = ("000001.SH", "399001.SZ", "399006.SZ", "000300.SH")
 
 
 # ── 打板数据底座（issue #22）：接口能力探测 ──────────────────────
@@ -167,11 +171,15 @@ class TushareFirstMarketDataClient:
         token: str | None = None,
         enabled: bool | None = None,
         tushare_module: Any = None,
+        zhitu: ZhituMarketData | None = None,
+        fuyao: FuyaoMarketData | None = None,
     ) -> None:
         self.fallback = fallback
         self.token = os.getenv("TUSHARE_TOKEN", "").strip() if token is None else token.strip()
         self.enabled = _enabled_from_env() if enabled is None else bool(enabled)
         self.tushare = _tushare if tushare_module is None else tushare_module
+        self.zhitu = zhitu
+        self.fuyao = fuyao
         self._pro: Any | None = None
         self._last_operation: dict[str, Any] = {}
 
@@ -180,10 +188,13 @@ class TushareFirstMarketDataClient:
         return bool(self.enabled and self.token and self.tushare is not None)
 
     def describe(self) -> dict[str, Any]:
+        alternatives = [name for name, client in (("zhitu", self.zhitu), ("fuyao", self.fuyao)) if client]
         return {
-            "primary": "tushare",
+            "primary": "/".join(alternatives) or "tushare",
             "fallback": "eastmoney/sina",
-            "realtime": "eastmoney",
+            "realtime": "zhitu" if self.zhitu else "eastmoney",
+            "zhitu_configured": self.zhitu is not None,
+            "fuyao_configured": self.fuyao is not None,
             "enabled": self.enabled,
             "configured": bool(self.token),
             "ready": self.is_ready,
@@ -216,9 +227,25 @@ class TushareFirstMarketDataClient:
         }
         return frame
 
+    async def _alternative(self, request: Any, *, operation: str, source: str) -> pd.DataFrame:
+        try:
+            frame = await request
+            if not frame.empty:
+                return self._mark(frame, operation=operation, source=source)
+            reason = f"{source}_empty_response"
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, MarketDataSourceError) else f"{source}_{type(exc).__name__}"
+        return self._mark(pd.DataFrame(), operation=operation, source="unavailable", fallback_reason=reason)
+
     async def fetch_spot(self) -> pd.DataFrame:
+        reason = ""
+        if self.zhitu:
+            frame = await self._alternative(self.zhitu.fetch_spot(), operation="realtime", source="zhitu")
+            if not frame.empty:
+                return frame
+            reason = frame.attrs["fallback_reason"]
         frame = await self.fallback.fetch_spot()
-        return self._mark(frame, operation="realtime", source="eastmoney")
+        return self._mark(frame, operation="realtime", source="eastmoney", fallback_reason=reason)
 
     async def fetch_hist(
         self,
@@ -228,6 +255,14 @@ class TushareFirstMarketDataClient:
         adjust: str = "qfq",
     ) -> pd.DataFrame:
         fallback_reason = "tushare_not_configured"
+        if self.zhitu:
+            frame = await self._alternative(
+                self.zhitu.fetch_hist(_to_ts_code(symbol), start_date, end_date, adjust),
+                operation="daily_history", source="zhitu",
+            )
+            if not frame.empty:
+                return frame
+            fallback_reason = frame.attrs["fallback_reason"]
         if self.is_ready:
             try:
                 frame = await run_blocking(
@@ -255,6 +290,13 @@ class TushareFirstMarketDataClient:
 
     async def fetch_trade_days(self, min_days: int = 0) -> pd.DataFrame:
         fallback_reason = "tushare_not_configured"
+        if self.fuyao:
+            frame = await self._alternative(
+                self.fuyao.fetch_trade_days(min_days), operation="trade_calendar", source="fuyao",
+            )
+            if not frame.empty:
+                return frame
+            fallback_reason = frame.attrs["fallback_reason"]
         if self.is_ready:
             try:
                 frame = await run_blocking(
@@ -278,6 +320,15 @@ class TushareFirstMarketDataClient:
 
     async def fetch_symbol_names(self) -> dict[str, str]:
         fallback_reason = "tushare_not_configured"
+        if self.zhitu:
+            try:
+                names = await self.zhitu.fetch_symbol_names()
+                if names:
+                    self._last_operation = {"operation": "stock_basic", "source": "zhitu", "fallback_reason": ""}
+                    return names
+                fallback_reason = "zhitu_empty_response"
+            except Exception as exc:
+                fallback_reason = f"zhitu_{type(exc).__name__}"
         if self.is_ready:
             try:
                 names = await run_blocking(
@@ -309,12 +360,21 @@ class TushareFirstMarketDataClient:
         return names
 
     async def fetch_daily_by_trade_date(self, trade_date: str) -> pd.DataFrame:
+        reason = "tushare_not_configured"
+        if self.fuyao:
+            frame = await self._alternative(
+                self.fuyao.fetch_market_history(trade_date, trade_date, adjusted=False),
+                operation="market_daily", source="fuyao",
+            )
+            if not frame.empty:
+                return frame
+            reason = frame.attrs["fallback_reason"]
         if not self.is_ready:
             return self._mark(
                 pd.DataFrame(),
                 operation="market_daily",
                 source="unavailable",
-                fallback_reason="tushare_not_configured",
+                fallback_reason=reason,
             )
         try:
             frame = await run_blocking(
@@ -333,6 +393,14 @@ class TushareFirstMarketDataClient:
             operation="market_daily",
             source="unavailable",
             fallback_reason=reason,
+        )
+
+    async def fetch_market_history(self, start_date: str, end_date: str) -> pd.DataFrame:
+        if not self.fuyao:
+            return pd.DataFrame()
+        return await self._alternative(
+            self.fuyao.fetch_market_history(start_date, end_date, adjusted=True),
+            operation="market_history", source="fuyao",
         )
 
     def _fetch_hist_sync(
@@ -482,6 +550,13 @@ class TushareFirstMarketDataClient:
         trade_date: str,
         ts_codes: list[str] | None = None,
     ) -> pd.DataFrame:
+        if self.fuyao:
+            frame = await self._alternative(
+                self.fuyao.fetch_index_daily(trade_date, ts_codes or list(_BENCHMARK_CODES)),
+                operation="index_daily", source="fuyao",
+            )
+            if not frame.empty or not self.is_ready:
+                return frame
         return await self._run_dataset(
             "index_daily", self._fetch_index_daily_sync, trade_date, ts_codes
         )
@@ -568,7 +643,7 @@ class TushareFirstMarketDataClient:
             raise ValueError("trade_date must use YYYY-MM-DD or YYYYMMDD")
         frames: list[pd.DataFrame] = []
         errors: list[str] = []
-        for ts_code in ts_codes or ["000001.SH", "399001.SZ", "399006.SZ", "000300.SH"]:
+        for ts_code in ts_codes or _BENCHMARK_CODES:
             try:
                 frame = self._pro_api().index_daily(
                     ts_code=ts_code,
