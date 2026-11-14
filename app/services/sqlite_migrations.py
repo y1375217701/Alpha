@@ -601,12 +601,19 @@ def _migrate_market_kline_v3(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_market_kline_v4(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "ALTER TABLE moneyflow_daily ADD COLUMN source TEXT NOT NULL DEFAULT 'tushare.moneyflow'"
+    )
+
+
 MARKET_KLINE_DB_MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         1, "market kline, sync task and report base schema", _migrate_market_kline_v1
     ),
     Migration(2, "Tushare enrichment tables", _migrate_market_kline_v2),
     Migration(3, "limit-up board data foundation (#22)", _migrate_market_kline_v3),
+    Migration(4, "daily moneyflow source", _migrate_market_kline_v4),
 )
 
 

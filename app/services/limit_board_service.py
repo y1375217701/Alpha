@@ -29,6 +29,7 @@ from typing import Any, Callable, Iterable
 import pandas as pd
 
 from app.services.market_data_client import _normalize_symbol
+from app.services.market_data_sources import EastmoneyDragonTiger, MarketDataSourceError
 from app.services.tushare_market_data_client import (
     CAPABILITY_DENIED,
     CAPABILITY_ERROR,
@@ -594,9 +595,11 @@ class LimitBoardService:
         store: Any,
         market_data_client: Any,
         enabled: bool | None = None,
+        eastmoney_dragon_tiger: EastmoneyDragonTiger | None = None,
     ) -> None:
         self.store = store
         self.client = market_data_client
+        self.eastmoney_dragon_tiger = eastmoney_dragon_tiger
         self._enabled = (
             _env_bool("ENABLE_LIMIT_BOARD_DATA", True)
             if enabled is None
@@ -884,6 +887,9 @@ class LimitBoardService:
             CAPABILITY_NOT_CONFIGURED,
             CAPABILITY_ERROR,
         }:
+            alternative = await self._sync_vendor_limit_board(trade_date)
+            if alternative is not None:
+                return alternative
             return await self._sync_limit_board_self_calc(
                 trade_date,
                 reason=str(result.reason or result.status),
@@ -903,6 +909,77 @@ class LimitBoardService:
             status="failed",
             rows=0,
             message=f"unexpected_status({result.status})",
+        )
+
+    async def _sync_vendor_limit_board(self, trade_date: str) -> dict[str, Any] | None:
+        zhitu = getattr(self.client, "zhitu", None)
+        fuyao = getattr(self.client, "fuyao", None)
+        pools: dict[str, list[dict[str, Any]]] = {}
+        if zhitu:
+
+            async def fetch_pool(flag: str) -> list[dict[str, Any]]:
+                for attempt in range(self._retry_attempts):
+                    try:
+                        return await zhitu.fetch_limit_pool(flag, trade_date)
+                    except MarketDataSourceError as exc:
+                        if attempt + 1 == self._retry_attempts or str(exc) in {
+                            "zhitu_http_401",
+                            "zhitu_http_403",
+                            "zhitu_http_404",
+                            "zhitu_http_429",
+                        }:
+                            raise
+                        await asyncio.sleep(self._retry_base_seconds * (2**attempt))
+                return []
+
+            flags = ("U", "D", "Z")
+            results = await asyncio.gather(
+                *(fetch_pool(flag) for flag in flags),
+                return_exceptions=True,
+            )
+            pools = {
+                flag: rows
+                for flag, rows in zip(flags, results, strict=True)
+                if not isinstance(rows, BaseException)
+            }
+        if fuyao and "Z" not in pools:
+            try:
+                pools["Z"] = await fuyao.fetch_limit_breaks(trade_date)
+            except MarketDataSourceError:
+                pass
+        if not pools:
+            return None
+
+        by_symbol = {}
+        for items in pools.values():
+            if items:
+                batch = normalize_rows("limit_list_d", pd.DataFrame(items))
+                for row in batch:
+                    row["source"] = items[0]["source"]
+                    # A closed limit-up takes precedence over a conflicting break entry.
+                    by_symbol.setdefault(row["symbol"], row)
+        rows = list(by_symbol.values())
+        missing = {"U", "D", "Z"} - pools.keys()
+        if missing:
+            source_rows = await asyncio.to_thread(
+                self.store.get_daily_with_limits, trade_date
+            )
+            rows.extend(
+                row
+                for row in derive_board_from_daily(source_rows)
+                if row["limit"] in missing and row["symbol"] not in by_symbol
+            )
+        written = await asyncio.to_thread(
+            self.store.upsert_limit_board_daily, rows, now_cn().isoformat()
+        )
+        return self._record(
+            DATASET_LIMIT_BOARD,
+            trade_date,
+            status="degraded" if missing else "success",
+            rows=written,
+            message=f"degraded:pool_missing({','.join(sorted(missing))})"
+            if missing
+            else "source=" + ",".join(sorted({row["source"] for row in rows})),
         )
 
     async def _sync_limit_board_self_calc(
@@ -1067,6 +1144,32 @@ class LimitBoardService:
     ) -> dict[str, Any]:
         api = "top_list"
         result = await self._call(api, trade_date, capabilities)
+        if result.status != RESULT_OK and self.eastmoney_dragon_tiger:
+            try:
+                items = await self.eastmoney_dragon_tiger.fetch_daily(trade_date)
+                if not items and trade_date == now_cn().date().isoformat():
+                    raise MarketDataSourceError("eastmoney_daily_board_not_published")
+            except MarketDataSourceError as exc:
+                return self._record(
+                    DATASET_DRAGON_TIGER,
+                    trade_date,
+                    status="failed",
+                    rows=0,
+                    message=str(exc),
+                )
+            rows = normalize_rows(api, pd.DataFrame(items))
+            for row in rows:
+                row["source"] = "eastmoney.dragon_tiger_daily"
+            written = await asyncio.to_thread(
+                self.store.upsert_dragon_tiger, rows, now_cn().isoformat()
+            )
+            return self._record(
+                DATASET_DRAGON_TIGER,
+                trade_date,
+                status="success",
+                rows=written,
+                message="source=eastmoney.dragon_tiger_daily",
+            )
         if result.status != RESULT_OK:
             status = (
                 "not_configured"
@@ -1095,7 +1198,36 @@ class LimitBoardService:
     async def _sync_dragon_tiger_seats(
         self, trade_date: str, capabilities: dict[str, dict[str, Any]]
     ) -> dict[str, Any]:
+        eastmoney_error = ""
         for api in ("top_inst", "hm_detail"):
+            if api == "hm_detail" and self.eastmoney_dragon_tiger:
+                try:
+                    items = await self.eastmoney_dragon_tiger.fetch_seats(trade_date)
+                    rows = dedupe_rows(
+                        normalize_rows("top_inst", pd.DataFrame(items)),
+                        ("trade_date", "symbol", "seat_name", "side", "reason"),
+                    )
+                    daily = await asyncio.to_thread(
+                        self.store.get_dragon_tiger, trade_date
+                    )
+                    if not rows and (daily or trade_date == now_cn().date().isoformat()):
+                        raise MarketDataSourceError("eastmoney_empty_seat_details")
+                    names = {row["symbol"]: row["name"] for row in daily}
+                    for row in rows:
+                        row["source"] = "eastmoney.dragon_tiger_seats"
+                        row["stock_name"] = names.get(row["symbol"])
+                    written = await asyncio.to_thread(
+                        self.store.upsert_dragon_tiger_seats, rows, now_cn().isoformat()
+                    )
+                    return self._record(
+                        DATASET_DRAGON_TIGER_SEAT,
+                        trade_date,
+                        status="success",
+                        rows=written,
+                        message="source=eastmoney.dragon_tiger_seats",
+                    )
+                except MarketDataSourceError as exc:
+                    eastmoney_error = str(exc)
             result = await self._call(api, trade_date, capabilities)
             if result.status != RESULT_OK:
                 continue
@@ -1127,9 +1259,9 @@ class LimitBoardService:
         return self._record(
             DATASET_DRAGON_TIGER_SEAT,
             trade_date,
-            status=status,
+            status="failed" if eastmoney_error else status,
             rows=0,
-            message="seat_sources_unavailable(top_inst,hm_detail)",
+            message=eastmoney_error or "seat_sources_unavailable(top_inst,hm_detail)",
         )
 
     async def _sync_hot_money_seats(

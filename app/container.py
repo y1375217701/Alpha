@@ -35,7 +35,11 @@ from app.services.kline_store import KlineSQLiteStore
 from app.services.kronos_predict_service import KronosPredictService
 from app.services.limit_board_service import LimitBoardService
 from app.services.market_data_client import EastmoneyMarketDataClient
-from app.services.market_data_sources import FuyaoMarketData, ZhituMarketData
+from app.services.market_data_sources import (
+    EastmoneyDragonTiger,
+    FuyaoMarketData,
+    ZhituMarketData,
+)
 from app.services.notice_service import NoticeService
 from app.services.observability import BackgroundTaskRegistry
 from app.services.paper_trading import PaperTradingService
@@ -400,7 +404,11 @@ def build_container(data_dir: str | Path | None = None) -> ServiceContainer:
         market_data_client=market_data_client if zhitu_token or fuyao_key else None,
     )
     limit_board_service = LimitBoardService(
-        store=kline_store, market_data_client=market_data_client
+        store=kline_store,
+        market_data_client=market_data_client,
+        eastmoney_dragon_tiger=EastmoneyDragonTiger()
+        if _live_market_data_enabled()
+        else None,
     )
     kline_cache_service = KlineCacheService(
         provider=provider,

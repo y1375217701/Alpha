@@ -6,6 +6,7 @@ import uuid
 import time as pytime
 from typing import Any
 
+import httpx
 import pandas as pd
 
 from app.services.data_provider import AkshareDataProvider, to_float
@@ -49,6 +50,7 @@ class KlineCacheService:
         self._syncing = False
         self._queue: list[tuple[str, dict[str, Any]]] = []
         self._queue_task: asyncio.Task | None = None
+        self._moneyflow_sync_lock = asyncio.Lock()
 
     def enqueue_sync_trade_date(
         self,
@@ -833,25 +835,40 @@ class KlineCacheService:
         )
 
     async def _run_enrichment_safely(self, trade_date: str, trigger_mode: str) -> None:
+        await self._run_limit_board_safely(trade_date, trigger_mode)
         try:
             await self.sync_enrichment(trade_date, trigger_mode=trigger_mode)
         except Exception as exc:
             print(f"[kline-cache] enrichment failed: {exc!r}")
-        await self._run_limit_board_safely(trade_date, trigger_mode)
 
-    async def _run_limit_board_safely(self, trade_date: str, trigger_mode: str) -> None:
+    async def _run_limit_board_safely(
+        self, trade_date: str, trigger_mode: str, datasets: list[str] | None = None
+    ) -> None:
         """打板数据底座同步（issue #22）；异常一律吞掉，主 K 线语义不变。"""
         service = self.limit_board_service
         if service is None:
             return
         try:
-            await service.sync_trade_date(trade_date, trigger_mode=trigger_mode)
+            if datasets is None:
+                await service.sync_trade_date(trade_date, trigger_mode=trigger_mode)
+            else:
+                await service.sync_trade_date(
+                    trade_date, trigger_mode=trigger_mode, datasets=datasets
+                )
         except Exception as exc:
             print(f"[kline-cache] limit board sync failed: {type(exc).__name__}")
 
     async def _retry_pending_enrichment(self, trade_date: str) -> None:
         tushare_ready = getattr(self.market_data_client, "is_ready", False)
-        if not tushare_ready and not getattr(self.market_data_client, "fuyao", None):
+        zhitu_ready = bool(getattr(self.market_data_client, "zhitu", None))
+        alternative_datasets = set()
+        if getattr(self.market_data_client, "fuyao", None):
+            alternative_datasets.update(("index_daily", "limit_board"))
+        if zhitu_ready:
+            alternative_datasets.update(("moneyflow", "limit_board", "limit_ladder"))
+        if getattr(self.limit_board_service, "eastmoney_dragon_tiger", None):
+            alternative_datasets.update(("dragon_tiger", "dragon_tiger_seat"))
+        if not tushare_ready and not alternative_datasets:
             return
         try:
             overview = await asyncio.to_thread(self.store.get_enrichment_overview)
@@ -862,11 +879,39 @@ class KlineCacheService:
             item["dataset"]
             for item in overview
             if item["dataset"] != "minute"
-            and (tushare_ready or item["dataset"] == "index_daily")
+            and (tushare_ready or item["dataset"] in alternative_datasets)
             and not self._dataset_satisfied(item, trade_date)
+            and (
+                item["dataset"] != "moneyflow"
+                or not zhitu_ready
+                or self._moneyflow_retry_due(item, trade_date)
+            )
         ]
-        if pending:
+        if not pending:
+            return
+        if tushare_ready:
             await self._run_enrichment_safely(trade_date, "auto")
+            return
+        board_datasets = [
+            name for name in pending if name not in {"moneyflow", "index_daily"}
+        ]
+        if board_datasets:
+            await self._run_limit_board_safely(trade_date, "auto", board_datasets)
+        if {"moneyflow", "index_daily"}.intersection(pending):
+            await self.sync_enrichment(
+                trade_date, trigger_mode="auto", datasets=pending
+            )
+
+    def _moneyflow_retry_due(self, item: dict[str, Any], trade_date: str) -> bool:
+        if self._moneyflow_sync_lock.locked():
+            return False
+        if item.get("trade_date") != trade_date or not item.get("updated_at"):
+            return True
+        try:
+            updated_at = parse_cn_datetime(str(item["updated_at"]))
+        except ValueError:
+            return True
+        return (now_cn() - updated_at).total_seconds() >= _ATTEMPT_RETRY_COOLDOWN_SEC
 
     @staticmethod
     def _dataset_satisfied(item: dict[str, Any], trade_date: str) -> bool:
@@ -928,6 +973,8 @@ class KlineCacheService:
         self,
         trade_date: str | None = None,
         trigger_mode: str = "manual",
+        *,
+        datasets: list[str] | None = None,
     ) -> dict[str, Any]:
         target = self._normalize_trade_date(
             trade_date
@@ -942,19 +989,29 @@ class KlineCacheService:
                 "trade_date": target,
             }
         if not getattr(self.market_data_client, "is_ready", False):
-            if getattr(self.market_data_client, "fuyao", None):
-                index = await self._run_enrichment_dataset(
-                    "index_daily",
-                    lambda: self.market_data_client.fetch_index_daily(target),
-                    self.store.upsert_index_daily,
-                    target,
-                    now_cn().isoformat(),
+            results = []
+            if (datasets is None or "index_daily" in datasets) and getattr(
+                self.market_data_client, "fuyao", None
+            ):
+                results.append(
+                    await self._run_enrichment_dataset(
+                        "index_daily",
+                        lambda: self.market_data_client.fetch_index_daily(target),
+                        self.store.upsert_index_daily,
+                        target,
+                        now_cn().isoformat(),
+                    )
                 )
+            if (datasets is None or "moneyflow" in datasets) and getattr(
+                self.market_data_client, "zhitu", None
+            ):
+                results.append(await self.sync_zhitu_moneyflow(target, target))
+            if results:
                 return {
-                    "success": index["status"] == "success",
+                    "success": all(item["status"] == "success" for item in results),
                     "trade_date": target,
                     "trigger_mode": trigger_mode,
-                    "datasets": [index],
+                    "datasets": results,
                 }
             return {
                 "success": False,
@@ -1005,15 +1062,18 @@ class KlineCacheService:
             }
         )
 
-        results.append(
-            await self._run_enrichment_dataset(
-                "moneyflow",
-                lambda: self.market_data_client.fetch_moneyflow_by_trade_date(target),
-                self.store.upsert_moneyflow,
-                target,
-                updated_at,
-            )
+        moneyflow = await self._run_enrichment_dataset(
+            "moneyflow",
+            lambda: self.market_data_client.fetch_moneyflow_by_trade_date(target),
+            self.store.upsert_moneyflow,
+            target,
+            updated_at,
         )
+        if moneyflow["status"] != "success" and getattr(
+            self.market_data_client, "zhitu", None
+        ):
+            moneyflow = await self.sync_zhitu_moneyflow(target, target)
+        results.append(moneyflow)
         results.append(
             await self._run_enrichment_dataset(
                 "hsgt",
@@ -1040,6 +1100,80 @@ class KlineCacheService:
             "trigger_mode": trigger_mode,
             "datasets": results,
         }
+
+    async def sync_zhitu_moneyflow(
+        self, start_date: str, end_date: str, *, progress: Any = None
+    ) -> dict[str, Any]:
+        """Fetch missing mainland stock-day rows through Zhitu's per-symbol range API."""
+        start = datetime.fromisoformat(start_date).date()
+        end = datetime.fromisoformat(end_date).date()
+        if start > end or (end - start).days >= 365:
+            raise ValueError(
+                "Zhitu moneyflow requires a range of 1 to 365 calendar days"
+            )
+        if not self._date_settled(end_date) or end > now_cn().date():
+            raise ValueError("moneyflow requires settled dates")
+        async with self._moneyflow_sync_lock:
+            gaps = await asyncio.to_thread(
+                self.store.get_moneyflow_gaps, start_date, end_date
+            )
+            written = 0
+            errors: set[str] = set()
+            async with httpx.AsyncClient(timeout=15.0) as session:
+                for offset in range(0, len(gaps), 32):
+                    batch = gaps[offset : offset + 32]
+                    (
+                        rows,
+                        failed,
+                    ) = await self.market_data_client.fetch_zhitu_moneyflow_batch(
+                        session, batch
+                    )
+                    errors.update(failed)
+                    if rows:
+                        written += await asyncio.to_thread(
+                            self.store.upsert_moneyflow, rows, now_cn().isoformat()
+                        )
+                    if progress:
+                        progress(offset + len(batch), len(gaps), written, errors)
+                    if errors.intersection(
+                        {"zhitu_http_401", "zhitu_http_403", "zhitu_http_429"}
+                    ):
+                        break
+            coverage = await asyncio.to_thread(
+                self.store.get_moneyflow_coverage, start_date, end_date
+            )
+            latest = (
+                coverage
+                if start_date == end_date
+                else await asyncio.to_thread(
+                    self.store.get_moneyflow_coverage, end_date, end_date
+                )
+            )
+
+            def status_for(counts: dict[str, int]) -> str:
+                if counts["expected"] and counts["covered"] == counts["expected"]:
+                    return "success"
+                return "partial" if counts["covered"] else "failed"
+
+            def message_for(counts: dict[str, int]) -> str:
+                message = f"zhitu.transaction:hs_traded={counts['covered']}/{counts['expected']}"
+                return message + (f"; {','.join(sorted(errors))}" if errors else "")
+
+            self.store.set_enrichment_state(
+                "moneyflow",
+                trade_date=end_date,
+                status=status_for(latest),
+                row_count=latest["covered"],
+                message=message_for(latest),
+                updated_at=now_cn().isoformat(),
+            )
+            return {
+                "dataset": "moneyflow",
+                "status": status_for(coverage),
+                "rows": written,
+                "message": message_for(coverage),
+                **coverage,
+            }
 
     async def sync_buy_pool_minutes(
         self,

@@ -1,8 +1,10 @@
 import asyncio
 
+import httpx
 import pandas as pd
 
 from app.services.market_data_sources import (
+    EastmoneyDragonTiger,
     MarketDataSourceError,
     ZhituMarketData,
     _date_ms,
@@ -78,3 +80,84 @@ def test_zhitu_normalizes_exchange_suffixes_for_lookup_and_spot(monkeypatch):
         ]
 
     asyncio.run(check())
+
+
+def test_zhitu_moneyflow_preserves_four_buy_sell_buckets_and_net():
+    def respond(request):
+        assert request.url.params["st"] == "2026-11-12"
+        assert request.url.params["et"] == "2026-11-13"
+        row = {
+            "t": "2026-11-12",
+            "zmbxdcje": 100,
+            "zmsxdcje": 60,
+            "zmbzdcje": 200,
+            "zmszdcje": 70,
+            "zmbddcje": 300,
+            "zmsddcje": 80,
+            "zmbtdcje": 400,
+            "zmstdcje": 90,
+        }
+        return httpx.Response(
+            200, json=[row, {**row, "t": "2026-11-13", "zmstdcje": None}]
+        )
+
+    async def check():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as session:
+            return await ZhituMarketData("fixture-token").fetch_moneyflow(
+                session, "000001.SZ", "2026-11-12", "2026-11-13"
+            )
+
+    assert asyncio.run(check()) == [
+        {
+            "symbol": "000001",
+            "trade_date": "2026-11-12",
+            "buy_sm_amount": 100.0,
+            "sell_sm_amount": 60.0,
+            "buy_md_amount": 200.0,
+            "sell_md_amount": 70.0,
+            "buy_lg_amount": 300.0,
+            "sell_lg_amount": 80.0,
+            "buy_elg_amount": 400.0,
+            "sell_elg_amount": 90.0,
+            "net_mf_amount": 700.0,
+            "source": "zhitu.transaction",
+        }
+    ]
+
+
+def test_eastmoney_seats_keep_side_and_fetch_all_pages(monkeypatch):
+    real_client = httpx.AsyncClient
+
+    def respond(request):
+        params = request.url.params
+        assert params["filter"] == "(TRADE_DATE='2026-11-13')"
+        page = int(params["pageNumber"])
+        side = params["reportName"].removeprefix("RPT_BILLBOARD_DAILYDETAILS")
+        row = {
+            "SECUCODE": "000001.SZ",
+            "TRADE_DATE": "2026-11-13 00:00:00",
+            "OPERATEDEPT_NAME": f"{side}{page}",
+            "BUY": 100 + page,
+            "SELL": 60,
+            "NET": 40 + page,
+        }
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "result": {"data": [row], "pages": 2, "count": 2},
+            },
+        )
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    rows = asyncio.run(EastmoneyDragonTiger().fetch_seats("2026-11-13"))
+    assert [(r["side"], r["seat_name"], r["net_amount"]) for r in rows] == [
+        ("buy", "BUY1", 41),
+        ("buy", "BUY2", 42),
+        ("sell", "SELL1", 41),
+        ("sell", "SELL2", 42),
+    ]

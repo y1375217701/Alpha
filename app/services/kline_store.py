@@ -759,6 +759,7 @@ class KlineSQLiteStore:
                 str(row.get("symbol", "")),
                 str(row.get("trade_date", "")),
                 *[self._optional_float(row, field) for field in fields],
+                str(row.get("source") or "tushare.moneyflow"),
                 updated_at,
             )
             for row in rows
@@ -770,16 +771,53 @@ class KlineSQLiteStore:
             conn.executemany(
                 f"""
                 INSERT INTO moneyflow_daily(
-                    symbol, trade_date, {", ".join(fields)}, updated_at
-                ) VALUES ({", ".join(["?"] * (len(fields) + 3))})
+                    symbol, trade_date, {", ".join(fields)}, source, updated_at
+                ) VALUES ({", ".join(["?"] * (len(fields) + 4))})
                 ON CONFLICT(symbol, trade_date) DO UPDATE SET
                     {", ".join(f"{field}=excluded.{field}" for field in fields)},
-                    updated_at=excluded.updated_at
+                    source=excluded.source, updated_at=excluded.updated_at
+                WHERE excluded.source != 'zhitu.transaction'
+                    OR moneyflow_daily.source = excluded.source
                 """,
                 payload,
             )
             conn.commit()
             return len(payload)
+
+    def get_moneyflow_gaps(
+        self, start_date: str, end_date: str
+    ) -> list[dict[str, str]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT k.symbol, MIN(k.trade_date) AS start_date, MAX(k.trade_date) AS end_date
+                FROM kline_daily AS k
+                LEFT JOIN moneyflow_daily AS m
+                    ON m.symbol = k.symbol AND m.trade_date = k.trade_date
+                WHERE k.trade_date BETWEEN ? AND ?
+                    AND substr(k.symbol, 1, 1) IN ('0', '3', '6')
+                    AND k.volume > 0 AND m.symbol IS NULL
+                GROUP BY k.symbol
+                ORDER BY k.symbol
+                """,
+                (start_date, end_date),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_moneyflow_coverage(self, start_date: str, end_date: str) -> dict[str, int]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS expected, COUNT(m.symbol) AS covered
+                FROM kline_daily AS k
+                LEFT JOIN moneyflow_daily AS m
+                    ON m.symbol = k.symbol AND m.trade_date = k.trade_date
+                WHERE k.trade_date BETWEEN ? AND ?
+                    AND substr(k.symbol, 1, 1) IN ('0', '3', '6') AND k.volume > 0
+                """,
+                (start_date, end_date),
+            ).fetchone()
+        return dict(row)
 
     def upsert_market_capital_flow(
         self, rows: list[dict[str, Any]], updated_at: str
@@ -987,6 +1025,7 @@ class KlineSQLiteStore:
                 "buy_elg_amount": row["buy_elg_amount"],
                 "sell_elg_amount": row["sell_elg_amount"],
                 "net_mf_amount": row["net_mf_amount"],
+                "source": row["source"],
             }
             for row in reversed(rows)
         ]

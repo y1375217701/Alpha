@@ -7,6 +7,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 import pandas as pd
 
 from app.services.blocking_io import (
@@ -539,6 +540,36 @@ class TushareFirstMarketDataClient:
         return await self._run_dataset(
             "moneyflow", self._fetch_moneyflow_sync, trade_date
         )
+
+    async def fetch_zhitu_moneyflow_batch(
+        self, session: httpx.AsyncClient, gaps: list[dict[str, str]]
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        if not self.zhitu:
+            return [], ["zhitu_not_configured"]
+        replies = await asyncio.gather(
+            *(
+                self.zhitu.fetch_moneyflow(
+                    session,
+                    _to_ts_code(gap["symbol"]),
+                    gap["start_date"],
+                    gap["end_date"],
+                )
+                for gap in gaps
+            ),
+            return_exceptions=True,
+        )
+        rows = []
+        errors = []
+        for reply in replies:
+            if isinstance(reply, BaseException):
+                errors.append(
+                    str(reply)
+                    if isinstance(reply, MarketDataSourceError)
+                    else type(reply).__name__
+                )
+            else:
+                rows.extend(reply)
+        return rows, errors
 
     async def fetch_moneyflow_hsgt(self, start_date: str, end_date: str) -> pd.DataFrame:
         return await self._run_dataset(
