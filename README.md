@@ -327,6 +327,8 @@ Alpha MCP Server（`mcp_server.py`）通过 stdio 协议暴露 16 个工具，�
 | **执行** | `get_agent_status` · `list_agent_tasks` · `trigger_notice_screen` | 查询 Agent 状态 / 最近任务 / 主动触发公告筛选 |
 
 ### 记忆系统
+Windows 本地可在独立的 Hermes Agent Python 环境中运行 Alpha 的 stdio MCP 服务。Hermes API 默认监听 `127.0.0.1:8642`，Alpha 的 `HERMES_AGENT_URL` 指向 `http://127.0.0.1:8642/v1`，两端使用同一个 `API_SERVER_KEY`。将 Hermes 的模型端点配置为已有的 CLIProxyAPI，可复用 `gpt-6.1-sol`。Alpha MCP 服务使用 `requirements-mcp.txt` 对应的 MCP 2.x 接口。
+
 
 | 层级 | 存储 | 内容 |
 |------|------|------|

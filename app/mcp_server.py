@@ -12,7 +12,7 @@ import os
 import re
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 ALPHA_API_BASE = os.environ.get("ALPHA_API_BASE", "http://127.0.0.1:18890")
 # 写操作令牌：与服务端 ALPHA_WRITE_TOKEN 一致时方可远程写入
@@ -20,7 +20,7 @@ ALPHA_WRITE_TOKEN = os.environ.get("ALPHA_WRITE_TOKEN", "").strip()
 
 _SYMBOL_RE = re.compile(r"^\d{6}$")
 
-mcp = FastMCP(
+mcp = MCPServer(
     name="alpha-quant",
     instructions=(
         "Alpha 量化选股系统工具集。提供漏斗状态查询、策略参数读取、"
