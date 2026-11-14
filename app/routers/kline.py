@@ -384,6 +384,7 @@ async def kline_cache_loop(kline_cache_service: KlineCacheService) -> None:
 async def minute_sync_loop(
     kline_cache_service: KlineCacheService,
     funnel_service: object,
+    *other_pools: object,
 ) -> None:
     """交易时段每分钟同步一次买入池分钟线；非交易时段空转。"""
     from app.config import POOL_BUY
@@ -395,9 +396,19 @@ async def minute_sync_loop(
                 kline_cache_service._is_trading_session()
                 and not kline_cache_service._syncing
             ):
-                symbols = await funnel_service.get_pool_symbols(POOL_BUY)
+                symbols = set(await funnel_service.get_pool_symbols(POOL_BUY))
+                for service in other_pools:
+                    symbols.update(
+                        row["symbol"]
+                        for row in service.get_snapshot()
+                        .get("pools", {})
+                        .get(POOL_BUY, [])
+                        if row.get("symbol")
+                    )
                 if symbols:
-                    result = await kline_cache_service.sync_buy_pool_minutes(symbols)
+                    result = await kline_cache_service.sync_buy_pool_minutes(
+                        sorted(symbols)
+                    )
                     if result.get("row_count"):
                         print(
                             f"[minute-sync] {result.get('trade_date')} "

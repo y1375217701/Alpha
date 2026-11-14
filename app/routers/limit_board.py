@@ -200,3 +200,17 @@ async def get_hot_money_seats(
             "游资席位数据暂时不可用", exc, 500, context="hot money seats query"
         )
     return {"count": len(items), "items": items}
+
+
+@router.get("/data/hsgt-top10/{trade_date}")
+async def get_hsgt_top10(
+    trade_date: str, container: ServiceContainer = Depends(get_container)
+):
+    query_date = _normalize_trade_date(trade_date)
+    try:
+        items = await asyncio.to_thread(
+            _service(container).store.get_hsgt_top10, query_date
+        )
+    except Exception as exc:
+        return error_detail("沪深股通成交榜暂时不可用", exc, 503, context="hsgt top10")
+    return {"trade_date": query_date, "count": len(items), "items": items}

@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, time
 import uuid
 import time as pytime
 from typing import Any
+from pathlib import Path
+from collections import Counter
 
 import httpx
 import pandas as pd
@@ -12,6 +14,7 @@ import pandas as pd
 from app.services.data_provider import AkshareDataProvider, to_float
 from app.services.kline_store import KlineSQLiteStore
 from app.services.market_data_client import EastmoneyMarketDataClient, _normalize_symbol
+from app.services.market_data_sources import MarketDataSourceError, read_fuyao_adjustment_history
 from app.services.time_utils import now_cn, parse_cn_datetime
 
 
@@ -863,9 +866,22 @@ class KlineCacheService:
         zhitu_ready = bool(getattr(self.market_data_client, "zhitu", None))
         alternative_datasets = set()
         if getattr(self.market_data_client, "fuyao", None):
-            alternative_datasets.update(("index_daily", "limit_board"))
+            alternative_datasets.update(
+                ("index_daily", "limit_board", "hot_money_seat")
+            )
         if zhitu_ready:
-            alternative_datasets.update(("moneyflow", "limit_board", "limit_ladder"))
+            alternative_datasets.update(
+                (
+                    "moneyflow",
+                    "hsgt",
+                    "hsgt_top10",
+                    "daily_extras",
+                    "limit_board",
+                    "limit_ladder",
+                )
+            )
+        if getattr(self.market_data_client, "axdata", None):
+            alternative_datasets.add("limit_board_theme")
         if getattr(self.limit_board_service, "eastmoney_dragon_tiger", None):
             alternative_datasets.update(("dragon_tiger", "dragon_tiger_seat"))
         if not tushare_ready and not alternative_datasets:
@@ -882,7 +898,7 @@ class KlineCacheService:
             and (tushare_ready or item["dataset"] in alternative_datasets)
             and not self._dataset_satisfied(item, trade_date)
             and (
-                item["dataset"] != "moneyflow"
+                item["dataset"] not in {"moneyflow", "daily_extras"}
                 or not zhitu_ready
                 or self._moneyflow_retry_due(item, trade_date)
             )
@@ -892,12 +908,11 @@ class KlineCacheService:
         if tushare_ready:
             await self._run_enrichment_safely(trade_date, "auto")
             return
-        board_datasets = [
-            name for name in pending if name not in {"moneyflow", "index_daily"}
-        ]
+        enrichment = {"moneyflow", "index_daily", "daily_extras", "hsgt"}
+        board_datasets = [name for name in pending if name not in enrichment]
         if board_datasets:
             await self._run_limit_board_safely(trade_date, "auto", board_datasets)
-        if {"moneyflow", "index_daily"}.intersection(pending):
+        if enrichment.intersection(pending):
             await self.sync_enrichment(
                 trade_date, trigger_mode="auto", datasets=pending
             )
@@ -990,6 +1005,21 @@ class KlineCacheService:
             }
         if not getattr(self.market_data_client, "is_ready", False):
             results = []
+            zhitu = getattr(self.market_data_client, "zhitu", None)
+            if zhitu and (datasets is None or "daily_extras" in datasets):
+                results.append(await self.sync_alternative_daily_extras(target))
+            if zhitu and (datasets is None or "hsgt" in datasets):
+                results.append(
+                    await self._run_enrichment_dataset(
+                        "hsgt",
+                        lambda: self.market_data_client.fetch_moneyflow_hsgt(
+                            target, target
+                        ),
+                        self.store.upsert_market_capital_flow,
+                        target,
+                        now_cn().isoformat(),
+                    )
+                )
             if (datasets is None or "index_daily" in datasets) and getattr(
                 self.market_data_client, "fuyao", None
             ):
@@ -1015,7 +1045,7 @@ class KlineCacheService:
                 }
             return {
                 "success": False,
-                "message": "Tushare 未配置，跳过增强数据同步",
+                "message": "当前没有可用的增强数据源",
                 "trade_date": target,
             }
 
@@ -1100,6 +1130,260 @@ class KlineCacheService:
             "trigger_mode": trigger_mode,
             "datasets": results,
         }
+
+    async def sync_alternative_daily_extras(self, target: str) -> dict[str, Any]:
+        client = self.market_data_client
+        symbols = await asyncio.to_thread(
+            self.store.get_daily_extra_gaps, target, target, "limits"
+        )
+        jobs = [client.zhitu.latest_daily_extras(target)]
+        if client.axdata and symbols:
+            jobs.append(client.axdata.price_limits(target))
+        results = await asyncio.gather(*jobs, return_exceptions=True)
+        rows: dict[str, dict[str, Any]] = {}
+        used = []
+        for result, source in zip(results, ("zhitu.snapshot", "axdata.price_limits")):
+            if isinstance(result, BaseException):
+                continue
+            if not result.empty:
+                used.append(source)
+            for row in result.dropna(how="all").to_dict("records"):
+                rows.setdefault(row["symbol"], {}).update(row)
+        updated_at = now_cn().isoformat()
+        written = await asyncio.to_thread(
+            self.store.upsert_daily_extras, list(rows.values()), updated_at
+        )
+        remaining = await asyncio.to_thread(
+            self.store.get_daily_extra_gaps, target, target, "limits"
+        )
+        if remaining:
+            limits = await self.sync_zhitu_price_limits(target, target, remaining)
+            if limits["rows"]:
+                used.append("zhitu.price_limits")
+        if client.axdata:
+            pending = await asyncio.to_thread(
+                self.store.get_daily_extra_gaps, target, target, "valuation"
+            )
+            if pending and await self.sync_axdata_valuations(
+                target, target, pending, workers=2
+            ):
+                used.append("axdata.valuation")
+        if client.fuyao:
+            coverage = await asyncio.to_thread(self.store.daily_extra_coverage, target)
+            if coverage["factors"] < coverage["expected"]:
+                factor_result = await self.sync_fuyao_adjustments(target, target)
+                if factor_result["rows"]:
+                    used.append("fuyao.adjustment_events")
+            if client.axdata and coverage["turnover_f"] < coverage["expected"]:
+                result = await self.sync_free_float_turnover(target)
+                if result:
+                    used.append("axdata.free_float_shares")
+        await asyncio.to_thread(
+            self.store.derive_daily_volume_ratios, target, target, updated_at
+        )
+        coverage = await asyncio.to_thread(self.store.daily_extra_coverage, target)
+        fields = (
+            "limits",
+            "factors",
+            "valuation",
+            "turnover",
+            "turnover_f",
+            "volume_ratio",
+        )
+        message = (
+            ",".join(used)
+            + " "
+            + ",".join(
+                f"{field}={coverage[field]}/{coverage['expected']}" for field in fields
+            )
+        )
+        written = max(written, coverage["total"])
+        status = (
+            (
+                "success"
+                if coverage["expected"]
+                and all(coverage[field] >= coverage["expected"] for field in fields)
+                else "partial"
+            )
+            if written
+            else "failed"
+        )
+        self.store.set_enrichment_state(
+            "daily_extras",
+            trade_date=target,
+            status=status,
+            row_count=written,
+            message=message,
+            updated_at=updated_at,
+        )
+        return {
+            "dataset": "daily_extras",
+            "status": status,
+            "rows": written,
+            "message": message,
+        }
+
+    async def sync_free_float_turnover(self, target: str) -> int:
+        client = self.market_data_client
+        try:
+            shares = await client.axdata.free_float_shares(target)
+            if not shares:
+                return 0
+            bars = await client.fuyao.fetch_market_history(
+                target, target, adjusted=False
+            )
+            if bars.empty:
+                return 0
+            free_float = bars["代码"].map(shares)
+            rows = pd.DataFrame(
+                {
+                    "symbol": bars["代码"],
+                    "trade_date": bars["日期"],
+                    "turnover_rate_f": 10_000 * bars["成交量"] / free_float,
+                }
+            ).dropna(subset=["turnover_rate_f"])
+            return await asyncio.to_thread(
+                self.store.upsert_daily_extras,
+                rows.to_dict("records"),
+                now_cn().isoformat(),
+            )
+        except MarketDataSourceError:
+            return 0
+
+    async def sync_axdata_valuations(
+        self,
+        start: str,
+        end: str,
+        symbols: list[str],
+        *,
+        batch_size: int = 16,
+        workers: int = 2,
+        progress: Any = None,
+    ) -> int:
+        from app.services.tushare_market_data_client import _to_ts_code
+
+        batches = [
+            symbols[i : i + batch_size] for i in range(0, len(symbols), batch_size)
+        ]
+        queue = asyncio.Queue()
+        for batch in batches:
+            queue.put_nowait(batch)
+        completed = 0
+        written = 0
+
+        async def worker() -> None:
+            nonlocal completed, written
+            while not queue.empty():
+                batch = queue.get_nowait()
+                error = ""
+                for attempt in range(3):
+                    try:
+                        frame = await self.market_data_client.axdata.valuation_history(
+                            [_to_ts_code(symbol) for symbol in batch], start, end
+                        )
+                        if not frame.empty:
+                            written += await asyncio.to_thread(
+                                self.store.upsert_daily_extras,
+                                frame.to_dict("records"),
+                                now_cn().isoformat(),
+                            )
+                        error = ""
+                        break
+                    except MarketDataSourceError as exc:
+                        error = str(exc)
+                        if error.endswith("_http_400"):
+                            if len(batch) > 1:
+                                middle = len(batch) // 2
+                                queue.put_nowait(batch[:middle])
+                                queue.put_nowait(batch[middle:])
+                                batches.extend((batch[:middle], batch[middle:]))
+                            break
+                        if attempt < 2:
+                            await asyncio.sleep(2**attempt)
+                completed += 1
+                if progress:
+                    progress(completed, len(batches), written, error)
+
+        await asyncio.gather(*(worker() for _ in range(workers)))
+        return written
+
+    async def sync_zhitu_price_limits(
+        self,
+        start: str,
+        end: str,
+        symbols: list[str],
+        *,
+        progress: Any = None,
+    ) -> dict[str, Any]:
+        from app.services.tushare_market_data_client import _to_ts_code
+
+        source = self.market_data_client.zhitu
+        errors: Counter[str] = Counter()
+        slots = asyncio.Semaphore(12)
+        async with httpx.AsyncClient(timeout=15) as session:
+
+            async def pull(symbol: str) -> list[dict[str, Any]]:
+                async with slots:
+                    try:
+                        return await source.price_limits(
+                            _to_ts_code(symbol), start, end, session
+                        )
+                    except Exception as exc:
+                        errors[
+                            str(exc)
+                            if isinstance(exc, MarketDataSourceError)
+                            else type(exc).__name__
+                        ] += 1
+                        return []
+
+            written = 0
+            for offset in range(0, len(symbols), 32):
+                batch = symbols[offset : offset + 32]
+                started = asyncio.get_running_loop().time()
+                parts = await asyncio.gather(*(pull(symbol) for symbol in batch))
+                rows = [row for group in parts for row in group]
+                written += await asyncio.to_thread(
+                    self.store.upsert_daily_extras, rows, now_cn().isoformat()
+                )
+                if progress:
+                    progress(offset + len(batch), len(symbols), written, errors)
+                if any(
+                    errors[key]
+                    for key in ("zhitu_http_429", "zhitu_http_403", "zhitu_http_401")
+                ):
+                    break
+                await asyncio.sleep(
+                    max(
+                        0,
+                        len(batch) / source.enrichment_requests_per_second
+                        - (asyncio.get_running_loop().time() - started),
+                    )
+                )
+        return {"rows": written, "errors": dict(errors)}
+
+    async def sync_fuyao_adjustments(
+        self, start: str, end: str, *, local_dumps: bool = False
+    ) -> dict[str, Any]:
+        try:
+            if local_dumps:
+                data = Path(self.store.db_path).parent
+                frame = await asyncio.to_thread(
+                    read_fuyao_adjustment_history, data / "fuyao-daily-k.parquet",
+                    data / "fuyao-adjustment-factors.parquet", start, end,
+                )
+            else:
+                frame = await self.market_data_client.fuyao.adjustment_history(start, end)
+            if frame.empty:
+                return {"rows": 0, "status": "empty"}
+            bases = await asyncio.to_thread(self.store.daily_extra_factors_before, start)
+            frame["adj_factor"] *= frame["symbol"].map(bases).fillna(1.0)
+            count = 0
+            for offset in range(0, len(frame), 20_000):
+                rows = frame.iloc[offset:offset + 20_000].to_dict("records")
+                count += await asyncio.to_thread(self.store.upsert_daily_extras, rows, now_cn().isoformat())
+            return {"rows": count, "status": "success"}
+        except Exception as exc:
+            return {"rows": 0, "status": "failed", "message": type(exc).__name__}
 
     async def sync_zhitu_moneyflow(
         self, start_date: str, end_date: str, *, progress: Any = None
@@ -1201,7 +1485,9 @@ class KlineCacheService:
                 "trade_date": trade_date,
                 "row_count": 0,
             }
-        if not getattr(self.market_data_client, "is_ready", False):
+        if not getattr(self.market_data_client, "is_ready", False) and not getattr(
+            self.market_data_client, "axdata", None
+        ):
             return {
                 "success": False,
                 "message": "Tushare 未配置，跳过分钟线同步",
@@ -1273,6 +1559,46 @@ class KlineCacheService:
             "errors": errors,
             "status": status,
         }
+
+    async def backfill_axdata_minutes(
+        self, symbols: list[str], start: str, end: str
+    ) -> dict[str, Any]:
+        if not self.market_data_client.axdata:
+            raise ValueError("AXDATA_BASE_URL is required")
+        semaphore = asyncio.Semaphore(2)
+        errors = []
+        newest = ""
+        written = 0
+
+        async def pull(symbol: str) -> None:
+            nonlocal newest, written
+            async with semaphore:
+                try:
+                    frame = await self.market_data_client.axdata.minute_bars(
+                        symbol, start, end
+                    )
+                    if frame.empty:
+                        errors.append(f"{symbol}:empty")
+                        return
+                    written += await asyncio.to_thread(
+                        self.store.upsert_minute_bars,
+                        frame.to_dict("records"),
+                        now_cn().isoformat(),
+                    )
+                    newest = max(newest, frame["trade_date"].max())
+                except Exception as exc:
+                    errors.append(f"{symbol}:{type(exc).__name__}")
+
+        await asyncio.gather(*(pull(symbol) for symbol in symbols))
+        status = (
+            "success" if written and not errors else "partial" if written else "failed"
+        )
+        if written:
+            self.store.set_enrichment_state(
+                "minute", trade_date=newest, status=status, row_count=written,
+                message="source=axdata.tdx_1m", updated_at=now_cn().isoformat(),
+            )
+        return {"dataset": "minute", "status": status, "rows": written, "errors": errors}
 
     async def _batch_fill_from_market_daily(
         self,

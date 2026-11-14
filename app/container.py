@@ -35,6 +35,7 @@ from app.services.kline_store import KlineSQLiteStore
 from app.services.kronos_predict_service import KronosPredictService
 from app.services.limit_board_service import LimitBoardService
 from app.services.market_data_client import EastmoneyMarketDataClient
+from app.services.axdata_market_data import AxDataMarketData
 from app.services.market_data_sources import (
     EastmoneyDragonTiger,
     FuyaoMarketData,
@@ -394,14 +395,18 @@ def build_container(data_dir: str | Path | None = None) -> ServiceContainer:
     eastmoney = EastmoneyMarketDataClient(store=kline_store)
     zhitu_token = os.getenv("ZHITU_TOKEN", "").strip() if _live_market_data_enabled() else ""
     fuyao_key = os.getenv("FUYAO_API_KEY", "").strip() if _live_market_data_enabled() else ""
+    axdata_url = os.getenv("AXDATA_BASE_URL", "").strip() if _live_market_data_enabled() else ""
+    axdata = AxDataMarketData(axdata_url) if axdata_url else None
     market_data_client = TushareFirstMarketDataClient(
         fallback=eastmoney,
         zhitu=ZhituMarketData(zhitu_token) if zhitu_token else None,
         fuyao=FuyaoMarketData(fuyao_key) if fuyao_key else None,
+        axdata=axdata,
     )
     provider = AkshareDataProvider(
         kline_store=kline_store,
         market_data_client=market_data_client if zhitu_token or fuyao_key else None,
+        axdata=axdata,
     )
     limit_board_service = LimitBoardService(
         store=kline_store,

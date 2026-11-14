@@ -9,8 +9,67 @@ from app.services.market_data_sources import (
     ZhituMarketData,
     _date_ms,
     _read_dump,
+    read_fuyao_adjustment_history,
 )
+from app.services.axdata_market_data import AxDataMarketData
 from app.services.tushare_market_data_client import TushareFirstMarketDataClient
+
+
+def test_fuyao_daily_factor_applies_cash_dividend_from_ex_date(tmp_path):
+    daily = tmp_path / "daily.parquet"
+    events = tmp_path / "events.parquet"
+    pd.DataFrame(
+        {
+            "thscode": ["000001.SZ"] * 3,
+            "date_ms": [
+                _date_ms(d) for d in ("2026-11-10", "2026-11-11", "2026-11-12")
+            ],
+            "close_price": [10.0, 9.0, 9.2],
+        }
+    ).to_parquet(daily)
+    pd.DataFrame(
+        {
+            "thscode": ["000001.SZ"],
+            "ex_date_ms": [_date_ms("2026-11-11")],
+            "currency": ["CNY"],
+            "dividend_per_share": [1.0],
+            "allotment_ratio": [0.0],
+            "allotment_price": [0.0],
+            "per_share_bonus": [0.0],
+        }
+    ).to_parquet(events)
+    result = read_fuyao_adjustment_history(daily, events, "2026-11-10", "2026-11-12")
+    assert result["adj_factor"].tolist() == [1.0, 10 / 9, 10 / 9]
+
+
+def test_axdata_concept_lookup_passes_provider_board_code(monkeypatch):
+    source = AxDataMarketData("http://localhost:8666")
+
+    async def fetch(interface, **params):
+        if interface == "eastmoney_sector_realtime":
+            return [{"sector_code": "BK1234", "sector_name": "样本", "change_pct": 4.0}]
+        assert interface == "eastmoney_sector_constituents"
+        assert params["sector_code"] == "BK1234"
+        return [
+            {
+                "symbol": "000001",
+                "name": "平安银行",
+                "last_price": 12,
+                "change_pct": 3.0,
+            }
+        ]
+
+    monkeypatch.setattr(source, "request", fetch)
+
+    async def check():
+        boards, name = await source.prediction_boards(1, "2026-11-13")
+        assert name == "axdata_eastmoney"
+        rows = await source.prediction_members(
+            name, boards.iloc[0]["board_code"], "2026-11-13", 10
+        )
+        assert rows.iloc[0]["代码"] == "000001"
+
+    asyncio.run(check())
 
 
 def test_fuyao_dump_keeps_trade_dates_units_and_adjustment_boundary(tmp_path):

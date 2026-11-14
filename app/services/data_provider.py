@@ -40,6 +40,7 @@ class AkshareDataProvider:
     kline_store: Any = None
     realtime_snapshot_timed_out: bool = False
     market_data_client: Any = None
+    axdata: Any = None
 
     def _snapshot_from_db(self) -> pd.DataFrame:
         """从本地 K 线数据库构建类行情快照（仅用于盘后或实时接口不可用时）。"""

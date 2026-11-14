@@ -742,6 +742,101 @@ class KlineSQLiteStore:
             conn.commit()
             return len(payload)
 
+    def get_daily_extra_gaps(self, start: str, end: str, field: str) -> list[str]:
+        missing = {
+            "valuation": "(e.pe_ttm IS NULL AND e.pb IS NULL AND e.ps_ttm IS NULL)",
+            "limits": "(e.up_limit IS NULL OR e.down_limit IS NULL)",
+        }[field]
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT k.symbol FROM kline_daily AS k
+                LEFT JOIN kline_daily_extras AS e
+                    ON k.symbol = e.symbol AND k.trade_date = e.trade_date
+                WHERE k.trade_date BETWEEN ? AND ? AND k.volume > 0 AND {missing}
+                ORDER BY k.symbol
+                """,
+                (start, end),
+            ).fetchall()
+        return [row["symbol"] for row in rows]
+
+    def daily_extra_factors_before(self, day: str) -> dict[str, float]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol, adj_factor, MAX(trade_date) AS last_date FROM kline_daily_extras
+                WHERE trade_date < ? AND adj_factor IS NOT NULL
+                GROUP BY symbol
+                """,
+                (day,),
+            ).fetchall()
+        return {row["symbol"]: row["adj_factor"] for row in rows}
+
+    def daily_extra_coverage(self, day: str) -> dict[str, int]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(k.symbol) AS expected, COUNT(e.symbol) AS total,
+                       COUNT(e.pe_ttm) AS valuation, COUNT(e.adj_factor) AS factors,
+                       COUNT(e.up_limit) AS limits, COUNT(e.turnover_rate) AS turnover,
+                       COUNT(e.volume_ratio) AS volume_ratio,
+                       COUNT(e.turnover_rate_f) AS turnover_f
+                FROM kline_daily k LEFT JOIN kline_daily_extras e
+                    ON k.symbol = e.symbol AND k.trade_date = e.trade_date
+                WHERE k.trade_date = ? AND k.volume > 0
+                """,
+                (day,),
+            ).fetchone()
+        return dict(row)
+
+    def derive_daily_turnover(
+        self, raw_bars: list[tuple[str, str, float, float]], updated_at: str
+    ) -> int:
+        with self._connect() as conn:
+            conn.execute(
+                "CREATE TEMP TABLE raw_bars(symbol TEXT, trade_date TEXT, close REAL, shares REAL)"
+            )
+            conn.executemany("INSERT INTO raw_bars VALUES (?, ?, ?, ?)", raw_bars)
+            cursor = conn.execute(
+                """
+                UPDATE kline_daily_extras AS e
+                SET turnover_rate = 100.0 * b.shares * b.close / e.circ_mv, updated_at = ?
+                FROM raw_bars AS b
+                WHERE e.symbol = b.symbol AND e.trade_date = b.trade_date
+                  AND b.shares > 0 AND b.close > 0
+                  AND e.circ_mv > 0 AND e.turnover_rate IS NULL
+                """,
+                (updated_at,),
+            )
+            conn.commit()
+            return int(cursor.rowcount)
+
+    def derive_daily_volume_ratios(self, start: str, end: str, updated_at: str) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                WITH volumes AS (
+                    SELECT symbol, trade_date, volume,
+                        AVG(volume) OVER days AS prev_volume,
+                        COUNT(*) OVER days AS prev_days
+                    FROM kline_daily
+                    WHERE trade_date BETWEEN date(?, '-30 days') AND ? AND volume > 0
+                    WINDOW days AS (
+                        PARTITION BY symbol ORDER BY trade_date ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING
+                    )
+                )
+                UPDATE kline_daily_extras AS e
+                SET volume_ratio = v.volume / v.prev_volume, updated_at = ?
+                FROM volumes AS v
+                WHERE e.symbol = v.symbol AND e.trade_date = v.trade_date
+                  AND v.trade_date BETWEEN ? AND ? AND v.prev_days = 5 AND v.prev_volume > 0
+                  AND e.volume_ratio IS NULL
+                """,
+                (start, end, updated_at, start, end),
+            )
+            conn.commit()
+            return conn.total_changes if cursor.rowcount < 0 else cursor.rowcount
+
     def upsert_moneyflow(self, rows: list[dict[str, Any]], updated_at: str) -> int:
         fields = [
             "buy_sm_amount",
@@ -843,10 +938,10 @@ class KlineSQLiteStore:
                     trade_date, hgt, sgt, north_money, south_money, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trade_date) DO UPDATE SET
-                    hgt=excluded.hgt,
-                    sgt=excluded.sgt,
-                    north_money=excluded.north_money,
-                    south_money=excluded.south_money,
+                    hgt=COALESCE(excluded.hgt, market_capital_flow.hgt),
+                    sgt=COALESCE(excluded.sgt, market_capital_flow.sgt),
+                    north_money=COALESCE(excluded.north_money, market_capital_flow.north_money),
+                    south_money=COALESCE(excluded.south_money, market_capital_flow.south_money),
                     updated_at=excluded.updated_at
                 """,
                 payload,
@@ -1528,6 +1623,8 @@ class KlineSQLiteStore:
                     last_trade_date=COALESCE(excluded.last_trade_date, hot_money_seat.last_trade_date),
                     source=excluded.source,
                     synced_at=excluded.synced_at
+                WHERE excluded.last_trade_date IS NULL OR hot_money_seat.last_trade_date IS NULL
+                    OR excluded.last_trade_date >= hot_money_seat.last_trade_date
                 """,
                 payload,
             )

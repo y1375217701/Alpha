@@ -160,22 +160,26 @@ Alpha 是一个面向 A 股市场的**自进化量化选股系统**。它不只�
 | 实时行情 | 智兔全市场快照 | 东方财富 / 新浪 / SQLite | 快照带行情日期，供增量同步校验 |
 | 交易日历 | 扶摇近一年交易日 | Tushare `trade_cal` / 新浪 / 新鲜 SQLite 日期 | `YYYY-MM-DD` |
 | 历史/日线 | 扶摇全市场 Parquet、智兔单股日线 | Tushare `daily` / `pro_bar` / 东方财富 K 线 | SQLite：`symbol, trade_date, open, high, low, close, volume, amount, source, fallback_reason` |
-| 日频增强 | Tushare `daily_basic` / `stk_limit` / `adj_factor` | — | SQLite `kline_daily_extras`：估值、换手、量比、市值、涨跌停价、复权因子 |
+| 日频增强 | Tushare `daily_basic` / `stk_limit` / `adj_factor` | AxData 历史估值、智兔涨跌停价与快照、扶摇除权事件 | SQLite `kline_daily_extras`：估值、换手、量比、市值、涨跌停价、复权因子 |
 | 个股资金流 | Tushare `moneyflow` | 智兔沪深个股历史资金流 | SQLite `moneyflow_daily`：小/中/大/特大单买卖额、净流入、来源 |
 | 涨停 / 跌停 / 炸板 | Tushare `limit_list_d` | 智兔股池 / 扶摇炸板股池 / 本地日线加涨跌停价 | SQLite `limit_board_daily` |
 | 龙虎榜与席位 | Tushare `top_list` / `top_inst` | 东方财富每日榜单及买卖席位 | SQLite `dragon_tiger_daily` / `dragon_tiger_seat_daily` |
-| 北向资金 | Tushare `moneyflow_hsgt` | — | SQLite `market_capital_flow`：沪股通、深股通、北向/南向合计 |
+| 沪深港通 | 智兔历史走势和十大成交股 | Tushare `moneyflow_hsgt` / `hsgt_top10` | SQLite `market_capital_flow` / `hsgt_top10_daily` |
 | 基准指数 | 扶摇批量指数日线 | Tushare `index_daily` | SQLite `index_daily`：上证/深证/创业板/沪深300 |
-| 分钟线 | Tushare `rt_min` | Tushare `realtime_quote` 单点兜底 | SQLite `kline_minute`：仅买入池，1 分钟 bar |
+| 分钟线 | Tushare `rt_min` | AxData 通达信 1 分钟线 / Tushare 实时单点 | SQLite `kline_minute`：买入池，1 分钟 bar |
+| 预测选股板块与成分 | AxData 东方财富概念、开盘红历史板块 | AkShare | 每轮预测结果随板块信息写入 `funnel_state.db` |
+| 打板题材与游资席位 | Tushare `kpl_list` / `hm_list` | AxData 开盘红涨停复盘 / 扶摇游资榜 | SQLite `limit_board_daily` / `hot_money_seat` |
 | 实时行情 | 东方财富 spot | 业务层既有降级路径 | Pandas DataFrame 中文列名；FastAPI 对外返回 JSON |
 
 Tushare `daily.vol` 以“手”为单位，直接映射为 `volume`；`daily.amount` 以“千元”为单位，写入 Alpha 前乘以 1000，统一为人民币“元”。`daily_basic.total_mv/circ_mv` 与资金流字段以“万元”为单位，写入前乘以 10000。`rt_min` 直接返回股数与人民币。策略产物仍按各模块使用 CSV / JSON，Kronos 输入使用英文 OHLCVA DataFrame。
 
-扶摇全市场日线按未复权口径提供，成交量从股换成手，成交额以元入库。手动历史回填需要前复权时，有除权除息事件的标的走智兔或既有单股前复权接口。扶摇复权事件用于判断何时走单股接口。全市场历史估值、日频复权因子和买入池分钟线沿用既有 Tushare 能力。
+扶摇全市场日线按未复权口径提供，成交量从股换成手，成交额以元入库。手动历史回填需要前复权时，有除权除息事件的标的走智兔或既有单股前复权接口。增强表中的扶摇复权因子以本地覆盖区间为锚，从除权事件逐日累积。补齐历史量比时使用当日成交量除以前五个有成交交易日的均量，历史换手率可用扶摇未复权成交量及收盘价、AxData 流通市值计算。自由流通股换手率按扶摇成交股数和同日 AxData 自由流通股本计算。
 
 智兔资金流按来源的四档主动买卖金额入库，单位元，净额为四档主动买入额之和减去主动卖出额之和。查询返回 `source`，便于分析时区分数据供应商的分档口径。当前智兔资金流适配覆盖有成交的沪深标的。
 
 在 Alpha 根目录运行 `python -m scripts.backfill_market_enrichment --start 2026-02-12 --end 2026-11-13`，按本地日线的交易日回填股池、龙虎榜及席位和缺失的沪深资金流。可用 `--dataset boards` 或 `--dataset moneyflow` 分别运行。资金流请求速率由 `ZHITU_MONEYFLOW_REQUESTS_PER_MINUTE` 控制，默认每分钟 240 次。
+
+配置 `AXDATA_BASE_URL=http://127.0.0.1:8666` 启用本机 AxData。`python -m scripts.backfill_extra_market_data <dataset>` 支持 `limits`、`valuation`、`factors`、`daily`、`indices-connect`、`boards`、`minutes`。可通过 `--start`、`--end` 限制交易日。已有扶摇 Parquet 时，`factors` 和 `daily` 可用 `--local-dumps`。沪深股通成交榜的买卖方向金额和沪深港通资金流按上游披露保留空值。
 
 ### 3. 策略选股
 
@@ -824,6 +828,7 @@ python3 scripts/repair_market_cache.py
 | GET | `/api/market/capital-flow` | 北向资金（沪股通/深股通/北向/南向） |
 | GET | `/api/market/index-daily` | 基准指数日线（`ts_code` 默认 `000001.SH`） |
 | POST | `/api/jobs/kline-cache/enrichment-sync` | 手动触发增强数据同步（指定 `trade_date`，同步返回各数据集结果） |
+| GET | `/api/data/hsgt-top10/{trade_date}` | 沪深股通十大成交股 |
 | GET | `/api/jobs/kline-cache/enrichment-status` | 增强数据覆盖状态（最新日期/行数/状态） |
 | POST | `/api/jobs/kline-cache/sync` | 提交全量补缺后台任务（202 Accepted） |
 | POST | `/api/jobs/kline-cache/incremental-sync` | 提交增量同步后台任务（202 Accepted） |

@@ -144,47 +144,116 @@ class PredictFunnelService:
         lookback = int(cfg["lookback"])
         t0 = time.time()
         concept_board_source = "em"
+        axdata = getattr(self.provider, "axdata", None)
+        ax_trade_date = ""
+        if axdata and self.provider.kline_store:
+            dates = await asyncio.to_thread(
+                self.provider.kline_store.get_trade_dates_from_db
+            )
+            ax_trade_date = dates[-1] if dates else ""
 
         self.progress.update(phase="boards", detail=f"获取东方财富概念板块 Top{top_k}")
         try:
-            concepts, concept_board_source = await self.provider.fetch_concept_board_names_em()
+            concepts = pd.DataFrame()
+            if axdata and ax_trade_date:
+                try:
+                    concepts, concept_board_source = await axdata.prediction_boards(
+                        top_k, ax_trade_date
+                    )
+                except Exception as exc:
+                    log.warning("AxData board lookup failed: %s", type(exc).__name__)
+            if concepts.empty:
+                (
+                    concepts,
+                    concept_board_source,
+                ) = await self.provider.fetch_concept_board_names_em()
         except Exception as exc:
             self.progress["error"] = f"概念板块获取失败: {exc}"
             return
         if concepts is None or concepts.empty:
             self.progress["error"] = "东方财富概念板块数据为空"
             return
-        name_col = "板块名称" if "板块名称" in concepts.columns else ("name" if "name" in concepts.columns else None)
+        name_col = (
+            "板块名称"
+            if "板块名称" in concepts.columns
+            else ("name" if "name" in concepts.columns else None)
+        )
         pct_col = "涨跌幅" if "涨跌幅" in concepts.columns else None
         if not name_col:
             self.progress["error"] = f"概念板块缺少名称列: {list(concepts.columns)[:8]}"
             return
         concepts = concepts.copy()
         if pct_col:
-            concepts[pct_col] = pd.to_numeric(concepts[pct_col], errors="coerce").fillna(0.0)
+            concepts[pct_col] = pd.to_numeric(
+                concepts[pct_col], errors="coerce"
+            ).fillna(0.0)
             concepts = concepts.sort_values(pct_col, ascending=False)
         hot_boards = concepts.head(top_k).copy()
         hot_boards = hot_boards.rename(columns={name_col: "板块名称"})
         if pct_col and pct_col != "涨跌幅":
             hot_boards = hot_boards.rename(columns={pct_col: "涨跌幅"})
 
-        self.progress.update(phase="constituents", detail=f"拉取 {len(hot_boards)} 个板块成分股")
+        self.progress.update(
+            phase="constituents", detail=f"拉取 {len(hot_boards)} 个板块成分股"
+        )
         stock_pool: dict[str, dict[str, Any]] = {}
-        for _, brow in hot_boards.iterrows():
+
+        async def members(brow):
+            name = str(brow.get("板块名称", "")).strip()
+            try:
+                if concept_board_source.startswith("axdata_"):
+                    return await axdata.prediction_members(
+                        concept_board_source,
+                        str(brow["board_code"]),
+                        ax_trade_date,
+                        top_m,
+                    )
+                return await self.provider.get_concept_constituents(
+                    name, fetch_if_missing=True
+                )
+            except Exception as exc:
+                log.warning(
+                    "[predict_funnel] cons fail %s: %s", name, type(exc).__name__
+                )
+                return pd.DataFrame()
+
+        board_rows = [row for _, row in hot_boards.iterrows()]
+        if concept_board_source.startswith("axdata_"):
+            constituents = await asyncio.gather(*(members(row) for row in board_rows))
+            if concept_board_source == "axdata_eastmoney" and all(
+                frame.empty for frame in constituents
+            ):
+                try:
+                    (
+                        historical,
+                        concept_board_source,
+                    ) = await axdata.historical_prediction_boards(top_k, ax_trade_date)
+                    if not historical.empty:
+                        hot_boards = historical
+                        board_rows = [row for _, row in historical.iterrows()]
+                        constituents = await asyncio.gather(
+                            *(members(row) for row in board_rows)
+                        )
+                except Exception as exc:
+                    log.warning(
+                        "AxData historical board lookup failed: %s", type(exc).__name__
+                    )
+        else:
+            constituents = [await members(row) for row in board_rows]
+        for brow, cons in zip(board_rows, constituents, strict=True):
             board_name = str(brow.get("板块名称", "")).strip()
             if not board_name:
                 continue
-            board_change = float(pd.to_numeric(brow.get("涨跌幅", 0), errors="coerce") or 0.0)
-            try:
-                cons = await self.provider.get_concept_constituents(board_name, fetch_if_missing=True)
-            except Exception as exc:
-                log.warning("[predict_funnel] cons fail %s: %s", board_name, exc)
-                cons = pd.DataFrame()
+            board_change = float(
+                pd.to_numeric(brow.get("涨跌幅", 0), errors="coerce") or 0.0
+            )
             if cons is None or cons.empty:
                 continue
             if "涨跌幅" in cons.columns:
                 cons = cons.copy()
-                cons["涨跌幅"] = pd.to_numeric(cons["涨跌幅"], errors="coerce").fillna(0.0)
+                cons["涨跌幅"] = pd.to_numeric(cons["涨跌幅"], errors="coerce").fillna(
+                    0.0
+                )
                 cons = cons.sort_values("涨跌幅", ascending=False)
             cons_top = cons.head(top_m)
             for _, srow in cons_top.iterrows():
@@ -209,6 +278,9 @@ class PredictFunnelService:
                 stock_pool[code]["boards"].append({"name": board_name, "change_pct": board_change})
 
         total = len(stock_pool)
+        if not total:
+            self.progress["error"] = "板块成分股为空"
+            return
         self.progress.update(phase="predict", total=total, current=0, detail=f"开始对 {total} 只股票预测")
         entries: list[dict[str, Any]] = []
         failed = 0
@@ -278,7 +350,7 @@ class PredictFunnelService:
 
         elapsed = time.time() - t0
         self._snapshot = {
-            "trade_date": now_cn().date().isoformat(),
+            "trade_date": ax_trade_date or now_cn().date().isoformat(),
             "entries": entries,
             "pools": pools,
             "updated_at": now_cn().isoformat(),

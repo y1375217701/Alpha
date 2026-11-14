@@ -67,7 +67,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         kline.kline_cache_loop(container.kline_cache_service), name="kline-cache"
     )
     app.state.minute_sync_task = asyncio.create_task(
-        kline.minute_sync_loop(container.kline_cache_service, container.funnel_service),
+        kline.minute_sync_loop(
+            container.kline_cache_service,
+            container.funnel_service,
+            container.predict_funnel_service,
+            container.hot_stock_ai_service,
+        ),
         name="minute-sync",
     )
     app.state.hermes_task = asyncio.create_task(

@@ -16,7 +16,13 @@ from app.services.blocking_io import (
     run_blocking,
 )
 from app.services.market_data_client import EastmoneyMarketDataClient, _normalize_symbol
-from app.services.market_data_sources import FuyaoMarketData, MarketDataSourceError, ZhituMarketData
+from app.services.market_data_sources import (
+    FuyaoMarketData,
+    MarketDataSourceError,
+    ZhituMarketData,
+)
+from app.services.axdata_market_data import AxDataMarketData
+from app.services.time_utils import now_cn
 
 try:
     import tushare as _tushare
@@ -174,13 +180,17 @@ class TushareFirstMarketDataClient:
         tushare_module: Any = None,
         zhitu: ZhituMarketData | None = None,
         fuyao: FuyaoMarketData | None = None,
+        axdata: AxDataMarketData | None = None,
     ) -> None:
         self.fallback = fallback
-        self.token = os.getenv("TUSHARE_TOKEN", "").strip() if token is None else token.strip()
+        self.token = (
+            os.getenv("TUSHARE_TOKEN", "").strip() if token is None else token.strip()
+        )
         self.enabled = _enabled_from_env() if enabled is None else bool(enabled)
         self.tushare = _tushare if tushare_module is None else tushare_module
         self.zhitu = zhitu
         self.fuyao = fuyao
+        self.axdata = axdata
         self._pro: Any | None = None
         self._last_operation: dict[str, Any] = {}
 
@@ -189,13 +199,18 @@ class TushareFirstMarketDataClient:
         return bool(self.enabled and self.token and self.tushare is not None)
 
     def describe(self) -> dict[str, Any]:
-        alternatives = [name for name, client in (("zhitu", self.zhitu), ("fuyao", self.fuyao)) if client]
+        alternatives = [
+            name
+            for name, client in (("zhitu", self.zhitu), ("fuyao", self.fuyao))
+            if client
+        ]
         return {
             "primary": "/".join(alternatives) or "tushare",
             "fallback": "eastmoney/sina",
             "realtime": "zhitu" if self.zhitu else "eastmoney",
             "zhitu_configured": self.zhitu is not None,
             "fuyao_configured": self.fuyao is not None,
+            "axdata_configured": self.axdata is not None,
             "enabled": self.enabled,
             "configured": bool(self.token),
             "ready": self.is_ready,
@@ -571,7 +586,17 @@ class TushareFirstMarketDataClient:
                 rows.extend(reply)
         return rows, errors
 
-    async def fetch_moneyflow_hsgt(self, start_date: str, end_date: str) -> pd.DataFrame:
+    async def fetch_moneyflow_hsgt(
+        self, start_date: str, end_date: str
+    ) -> pd.DataFrame:
+        if self.zhitu:
+            frame = await self._alternative(
+                self.zhitu.connect_flows(start_date, end_date),
+                operation="hsgt",
+                source="zhitu",
+            )
+            if not frame.empty or not self.is_ready:
+                return frame
         return await self._run_dataset(
             "moneyflow_hsgt", self._fetch_moneyflow_hsgt_sync, start_date, end_date
         )
@@ -583,8 +608,11 @@ class TushareFirstMarketDataClient:
     ) -> pd.DataFrame:
         if self.fuyao:
             frame = await self._alternative(
-                self.fuyao.fetch_index_daily(trade_date, ts_codes or list(_BENCHMARK_CODES)),
-                operation="index_daily", source="fuyao",
+                self.fuyao.fetch_index_daily(
+                    trade_date, ts_codes or list(_BENCHMARK_CODES)
+                ),
+                operation="index_daily",
+                source="fuyao",
             )
             if not frame.empty or not self.is_ready:
                 return frame
@@ -593,9 +621,11 @@ class TushareFirstMarketDataClient:
         )
 
     async def fetch_rt_min(self, symbol: str, freq: str = "1MIN") -> pd.DataFrame:
-        return await self._run_dataset(
-            "rt_min", self._fetch_rt_min_sync, symbol, freq
-        )
+        frame = await self._run_dataset("rt_min", self._fetch_rt_min_sync, symbol, freq)
+        if frame.empty and self.axdata and freq == "1MIN":
+            today = now_cn().date().isoformat()
+            return await self.axdata.minute_bars(symbol, today, today)
+        return frame
 
     async def fetch_realtime_quote(self, symbol: str) -> dict[str, Any] | None:
         if not self.is_ready:

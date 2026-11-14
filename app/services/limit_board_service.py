@@ -1007,6 +1007,28 @@ class LimitBoardService:
         api = "kpl_list"
         result = await self._call(api, trade_date, capabilities)
         if result.status != RESULT_OK:
+            axdata = getattr(self.client, "axdata", None)
+            if axdata:
+                try:
+                    rows = await axdata.limit_themes(trade_date)
+                except MarketDataSourceError as exc:
+                    return self._record(
+                        DATASET_LIMIT_THEME,
+                        trade_date,
+                        status="failed",
+                        rows=0,
+                        message=str(exc),
+                    )
+                written = await asyncio.to_thread(
+                    self.store.update_limit_board_theme, rows, now_cn().isoformat()
+                )
+                return self._record(
+                    DATASET_LIMIT_THEME,
+                    trade_date,
+                    status="success" if written else "failed",
+                    rows=written,
+                    message="source=axdata.kph_limit_resumption_history",
+                )
             status = (
                 "not_configured"
                 if result.status == CAPABILITY_NOT_CONFIGURED
@@ -1210,7 +1232,9 @@ class LimitBoardService:
                     daily = await asyncio.to_thread(
                         self.store.get_dragon_tiger, trade_date
                     )
-                    if not rows and (daily or trade_date == now_cn().date().isoformat()):
+                    if not rows and (
+                        daily or trade_date == now_cn().date().isoformat()
+                    ):
                         raise MarketDataSourceError("eastmoney_empty_seat_details")
                     names = {row["symbol"]: row["name"] for row in daily}
                     for row in rows:
@@ -1281,6 +1305,28 @@ class LimitBoardService:
                 rows=written,
                 message="ok",
             )
+        fuyao = getattr(self.client, "fuyao", None)
+        if fuyao:
+            try:
+                rows = await fuyao.hot_money(trade_date)
+            except MarketDataSourceError as exc:
+                return self._record(
+                    DATASET_HOT_MONEY_SEAT,
+                    trade_date,
+                    status="failed",
+                    rows=0,
+                    message=str(exc),
+                )
+            written = await asyncio.to_thread(
+                self.store.upsert_hot_money_seats, rows, now_cn().isoformat()
+            )
+            return self._record(
+                DATASET_HOT_MONEY_SEAT,
+                trade_date,
+                status="success" if written else "failed",
+                rows=written,
+                message="source=fuyao.hot_money",
+            )
         # 降级：用龙虎榜营业部名做游资席位代理（issue 明确的降级路径）。
         seats = await asyncio.to_thread(self.store.get_dragon_tiger_seats, trade_date)
         names: dict[str, dict[str, Any]] = {}
@@ -1321,6 +1367,28 @@ class LimitBoardService:
         api = "hsgt_top10"
         result = await self._call(api, trade_date, capabilities)
         if result.status != RESULT_OK:
+            zhitu = getattr(self.client, "zhitu", None)
+            if zhitu:
+                try:
+                    rows = await zhitu.connect_top10(trade_date, trade_date)
+                except MarketDataSourceError as exc:
+                    return self._record(
+                        DATASET_HSGT_TOP10,
+                        trade_date,
+                        status="failed",
+                        rows=0,
+                        message=str(exc),
+                    )
+                written = await asyncio.to_thread(
+                    self.store.upsert_hsgt_top10, rows, now_cn().isoformat()
+                )
+                return self._record(
+                    DATASET_HSGT_TOP10,
+                    trade_date,
+                    status="success" if written else "failed",
+                    rows=written,
+                    message="source=zhitu.connect_top10",
+                )
             status = (
                 "not_configured"
                 if result.status == CAPABILITY_NOT_CONFIGURED

@@ -207,6 +207,7 @@ class ZhituMarketData:
         except ValueError:
             requests_per_minute = 240
         self._moneyflow_interval = 60 / max(1, min(requests_per_minute, 6000))
+        self.enrichment_requests_per_second = min(26, 1 / self._moneyflow_interval)
         self._moneyflow_lock = asyncio.Lock()
         self._next_moneyflow_request = 0.0
         self._moneyflow_blocked_until = 0.0
@@ -268,6 +269,123 @@ class ZhituMarketData:
             }
             for row in raw
             if row.get("dm")
+        ]
+
+    async def price_limits(
+        self,
+        ts_code: str,
+        start: str,
+        end: str,
+        session: httpx.AsyncClient | None = None,
+    ) -> list[dict[str, Any]]:
+        market = "bj" if ts_code.endswith(".BJ") else "hs"
+        path = f"/{market}/stopprice/history/{ts_code}"
+        params = {"st": start.replace("-", ""), "et": end.replace("-", "")}
+        try:
+            raw = (
+                await self._items(path, **params)
+                if session is None
+                else await _json(
+                    session,
+                    "zhitu",
+                    _ZHITU + path,
+                    params={**params, "token": self._token},
+                )
+            )
+        except MarketDataSourceError as exc:
+            if str(exc) == "zhitu_http_404":
+                return []
+            raise
+        if not isinstance(raw, list):
+            raise MarketDataSourceError("zhitu_invalid_price_limits")
+        return [
+            {
+                "symbol": _normalize_symbol(ts_code),
+                "trade_date": row["t"][:10],
+                "up_limit": row.get("h"),
+                "down_limit": row.get("l"),
+            }
+            for row in raw
+            if start <= str(row.get("t") or "")[:10] <= end
+            and row.get("h", 0)
+            and row.get("l", 0)
+        ]
+
+    async def latest_daily_extras(self, trade_date: str) -> pd.DataFrame:
+        frame = await self.fetch_spot()
+        if frame.empty:
+            return frame
+        frame = frame.loc[frame["行情日期"] == trade_date].rename(
+            columns={
+                "代码": "symbol",
+                "行情日期": "trade_date",
+                "换手率": "turnover_rate",
+                "量比": "volume_ratio",
+                "总市值": "total_mv",
+                "流通市值": "circ_mv",
+            }
+        )
+        return frame[
+            [
+                "symbol",
+                "trade_date",
+                "turnover_rate",
+                "volume_ratio",
+                "total_mv",
+                "circ_mv",
+            ]
+        ]
+
+    async def connect_flows(self, start: str, end: str) -> pd.DataFrame:
+        north, south = await asyncio.gather(
+            self._items("/ht/nbzj/bxls/all"), self._items("/ht/nbzj/nxls/all")
+        )
+        rows: dict[str, dict[str, Any]] = {}
+        for raw, columns in (
+            (north, {"hgt": "hgt", "sgt": "sgt", "north_money": "bx"}),
+            (south, {"south_money": "nx"}),
+        ):
+            for item in raw:
+                day = item.get("t", "")[:10]
+                if not start <= day <= end:
+                    continue
+                values = {
+                    key: item[src] * 1_000_000
+                    for key, src in columns.items()
+                    if item.get(src) is not None
+                }
+                if values:
+                    rows.setdefault(day, {"trade_date": day}).update(values)
+        return pd.DataFrame(list(rows.values()))
+
+    async def connect_top10(self, start: str, end: str) -> list[dict[str, Any]]:
+        sh, sz = await asyncio.gather(
+            self._items("/ht/nbzj/hgts"), self._items("/ht/nbzj/sgts")
+        )
+        return [
+            {
+                "symbol": row["dm"],
+                "trade_date": row["t"][:10],
+                "market_type": market,
+                "name": row.get("mc"),
+                "rank_no": row.get("pm"),
+                "close": row.get("c"),
+                "change": row.get("zdf"),
+                "amount": row.get("cj"),
+                "source": "zhitu.connect_top10",
+                **(
+                    {
+                        "net_amount": row.get("jm"),
+                        "buy_amount": row.get("mr"),
+                        "sell_amount": row.get("mce"),
+                    }
+                    if row["t"][:10] < "2024-08-19"
+                    else {}
+                ),
+            }
+            for market, items in (("1", sh), ("3", sz))
+            for row in items
+            if row.get("dm") and start <= row.get("t", "")[:10] <= end
         ]
 
     async def fetch_moneyflow(
@@ -389,6 +507,98 @@ def _date_ms(day: str) -> int:
     return int(pd.Timestamp(day, tz="Asia/Shanghai").timestamp() * 1000)
 
 
+def read_fuyao_raw_turnover(path: Path, start: str, end: str) -> pd.DataFrame:
+    raw = pd.read_parquet(
+        path,
+        columns=["thscode", "date_ms", "close_price", "volume"],
+        filters=[("date_ms", ">=", _date_ms(start)), ("date_ms", "<=", _date_ms(end))],
+    )
+    raw["symbol"] = raw["thscode"].str[:6]
+    raw["trade_date"] = (
+        pd.to_datetime(raw["date_ms"], unit="ms", utc=True)
+        .dt.tz_convert("Asia/Shanghai")
+        .dt.strftime("%Y-%m-%d")
+    )
+    return raw[["symbol", "trade_date", "close_price", "volume"]]
+
+
+def read_fuyao_adjustment_history(
+    daily_path: Path,
+    events_path: Path,
+    start: str,
+    end: str,
+) -> pd.DataFrame:
+    columns = ["thscode", "date_ms", "close_price"]
+    bars = pd.read_parquet(
+        daily_path,
+        columns=columns,
+        filters=[
+            (
+                "date_ms",
+                ">=",
+                _date_ms((date.fromisoformat(start) - timedelta(days=60)).isoformat()),
+            ),
+            ("date_ms", "<=", _date_ms(end)),
+        ],
+    ).sort_values(["thscode", "date_ms"])
+    events = pd.read_parquet(
+        events_path,
+        filters=[
+            ("ex_date_ms", ">=", _date_ms(start)),
+            ("ex_date_ms", "<=", _date_ms(end)),
+        ],
+    )
+    events = events.loc[events["currency"] == "CNY"].rename(
+        columns={"ex_date_ms": "date_ms"}
+    )
+    # Fuyao reports corporate actions, so derive a cumulative factor anchored to the cache window.
+    # Attach any action during a suspension to the first bar on or after its ex-date.
+    bars["previous_close"] = bars.groupby("thscode")["close_price"].shift()
+    linked = pd.merge_asof(
+        events.sort_values("date_ms"),
+        bars.sort_values("date_ms").rename(columns={"date_ms": "bar_date"}),
+        left_on="date_ms",
+        right_on="bar_date",
+        by="thscode",
+        direction="forward",
+    ).dropna(subset=["bar_date"])
+    financial = ["dividend_per_share", "per_share_bonus", "allotment_ratio"]
+    linked["allotment_cash"] = linked["allotment_ratio"] * linked["allotment_price"]
+    linked = (
+        linked.groupby(["thscode", "bar_date"], as_index=False)
+        .agg(
+            {
+                **{column: "sum" for column in [*financial, "allotment_cash"]},
+                "previous_close": "first",
+                "date_ms": "nunique",
+            }
+        )
+        .rename(columns={"bar_date": "date_ms", "date_ms": "event_dates"})
+    )
+    reference = (
+        linked["previous_close"]
+        - linked["dividend_per_share"]
+        + linked["allotment_cash"]
+    ) / (1 + linked["per_share_bonus"] + linked["allotment_ratio"])
+    linked["step"] = linked["previous_close"] / reference
+    bars = bars.merge(linked[["thscode", "date_ms", "step", "event_dates"]], how="left")
+    unavailable = bars["event_dates"].notna() & (
+        ~bars["step"].gt(0) | bars["event_dates"].gt(1)
+    )
+    bars["unknown_factor"] = unavailable.groupby(bars["thscode"]).cummax()
+    bars["adj_factor"] = bars["step"].fillna(1).groupby(bars["thscode"]).cumprod()
+    bars = bars.loc[
+        bars["date_ms"].ge(_date_ms(start)) & ~bars["unknown_factor"]
+    ].copy()
+    bars["symbol"] = bars["thscode"].str[:6]
+    bars["trade_date"] = (
+        pd.to_datetime(bars["date_ms"], unit="ms", utc=True)
+        .dt.tz_convert("Asia/Shanghai")
+        .dt.strftime("%Y-%m-%d")
+    )
+    return bars[["symbol", "trade_date", "adj_factor"]]
+
+
 def _read_dump(
     path: Path, events_path: Path | None, start: int, end: int
 ) -> pd.DataFrame:
@@ -486,8 +696,12 @@ class FuyaoMarketData:
                         "name": row.get("name"),
                         "limit": "Z",
                         # Fuyao publishes minute precision as HH:mm.
-                        "first_time": str(row.get("first_seal_time") or "").replace(":", ""),
-                        "last_time": str(row.get("last_seal_time") or "").replace(":", ""),
+                        "first_time": str(row.get("first_seal_time") or "").replace(
+                            ":", ""
+                        ),
+                        "last_time": str(row.get("last_seal_time") or "").replace(
+                            ":", ""
+                        ),
                         "open_times": row.get("open_times"),
                         "amount": row.get("turnover"),
                         "turnover_ratio": row.get("turnover_ratio_pct"),
@@ -507,9 +721,18 @@ class FuyaoMarketData:
     async def fetch_index_daily(
         self, trade_date: str, codes: list[str]
     ) -> pd.DataFrame:
-        day = pd.Timestamp(trade_date)
-        end = _date_ms(day.date().isoformat())
-        start = _date_ms((day - timedelta(days=14)).date().isoformat())
+        frame = await self.fetch_index_range(trade_date, trade_date, codes)
+        if frame.empty or set(frame["ts_code"]) != set(codes):
+            return pd.DataFrame()
+        return frame
+
+    async def fetch_index_range(
+        self, start_date: str, end_date: str, codes: list[str]
+    ) -> pd.DataFrame:
+        start = _date_ms(
+            (date.fromisoformat(start_date) - timedelta(days=14)).isoformat()
+        )
+        end = _date_ms(end_date)
         async with httpx.AsyncClient(timeout=8.0) as client:
             data = await self._get(
                 client,
@@ -521,31 +744,75 @@ class FuyaoMarketData:
             )
         rows = []
         for group in data["item"]:
-            bars = group["item"]
-            if not bars or bars[-1]["date_ms"] != end:
-                continue
-            bar = bars[-1]
-            prev = bars[-2]["close_price"] if len(bars) > 1 else None
-            close = bar["close_price"]
-            change = close - prev if prev and close else None
-            rows.append(
-                {
-                    "ts_code": group["thscode"],
-                    "trade_date": day.date().isoformat(),
-                    "open": bar["open_price"],
-                    "high": bar["high_price"],
-                    "low": bar["low_price"],
-                    "close": close,
-                    "pre_close": prev,
-                    "change": change,
-                    "pct_chg": 100 * change / prev if change is not None else None,
-                    "volume": bar["volume"] / 100.0,
-                    "amount": bar["turnover"],
-                }
-            )
-        if {row["ts_code"] for row in rows} != set(codes):
-            return pd.DataFrame()
+            prev = None
+            for bar in sorted(group["item"], key=lambda item: item["date_ms"]):
+                day = (
+                    pd.Timestamp(bar["date_ms"], unit="ms", tz="UTC")
+                    .tz_convert("Asia/Shanghai")
+                    .date()
+                    .isoformat()
+                )
+                close = bar["close_price"]
+                change = close - prev if prev and close else None
+                if start_date <= day <= end_date:
+                    rows.append(
+                        {
+                            "ts_code": group["thscode"],
+                            "trade_date": day,
+                            "open": bar["open_price"],
+                            "high": bar["high_price"],
+                            "low": bar["low_price"],
+                            "close": close,
+                            "pre_close": prev,
+                            "change": change,
+                            "pct_chg": 100 * change / prev
+                            if change is not None
+                            else None,
+                            "volume": bar["volume"] / 100.0,
+                            "amount": bar["turnover"],
+                        }
+                    )
+                prev = close
         return pd.DataFrame(rows)
+
+    async def hot_money(self, trade_date: str) -> list[dict[str, Any]]:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            body = await self._get(
+                client,
+                "/api/a-share/special-data/dragon-tiger-list",
+                date=trade_date,
+                board_type="hot_money",
+            )
+        if body.get("trade_date") != trade_date:
+            raise MarketDataSourceError("fuyao_hot_money_wrong_date")
+        return [
+            {
+                "seat_name": row["name"],
+                "org_code": "",
+                "category": "游资",
+                "appear_count": len(row.get("rows") or []),
+                "last_trade_date": trade_date,
+                "source": "fuyao.hot_money",
+            }
+            for row in body["hot_money_items"]
+            if row.get("name")
+        ]
+
+    async def adjustment_history(self, start: str, end: str) -> pd.DataFrame:
+        with TemporaryDirectory(prefix="alpha-fuyao-actions-") as scratch:
+            daily = Path(scratch) / "daily.parquet"
+            events = Path(scratch) / "events.parquet"
+            kind = (
+                "daily-k-10d"
+                if date.fromisoformat(start) >= now_cn().date() - timedelta(days=10)
+                else "daily-k"
+            )
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                await self._download_dump(client, kind, daily)
+                await self._download_dump(client, "adjustment-factors", events)
+            return await asyncio.to_thread(
+                read_fuyao_adjustment_history, daily, events, start, end
+            )
 
     async def _download_dump(
         self, client: httpx.AsyncClient, kind: str, path: Path
