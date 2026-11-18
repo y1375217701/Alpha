@@ -224,8 +224,9 @@ Tushare `daily.vol` 以“手”为单位，直接映射为 `volume`；`daily.am
 
 - **实时输入**：直接复用 `/api/market/hot-stocks` 的实时热门股接口，默认取前 20
 - **逐股分析**：结合热度排名、当日涨幅、趋势位置、20 日量额比和 `Kronos` 三日预测
-- **深度讨论**：对命中的热门股调用 [TradingAgents](https://github.com/Shadowell/TradingAgents) 项目，通过 `DeepSeek API` 产出多代理讨论结论，再映射为加减分
-- **命令行调用方式**：Alpha 通过 `uv run python -m cli.main analyze --ticker ... --date ... --provider deepseek --quick-model deepseek-chat --deep-model deepseek-reasoner` 调用 `TradingAgents`，不再直接 import 图对象
+- **深度讨论**：对命中的热门股调用 [TradingAgents](https://github.com/Shadowell/TradingAgents) 项目，通过 DeepSeek 或 OpenAI 兼容端点产出多代理讨论结论，再映射为加减分
+- **本地调用方式**：在 `TradingAgents` 仓库准备好 `uv` 环境，并在 Alpha 配置 `DEEPSEEK_API_KEY`。Alpha 通过独立进程调用 `TradingAgentsGraph`，默认使用 `deepseek-flash` 和 `deepseek-v4-pro`。仓库和 `uv` 的路径可通过 `TRADINGAGENTS_REPO_PATH`、`TRADINGAGENTS_UV_BIN` 指定。
+- **共用模型端点**：设置 `TRADINGAGENTS_PROVIDER=openai` 后，TradingAgents 的快速和深度分析都使用 `HERMES_MODEL`，通过 `OPENAI_BASE_URL` 和 `OPENAI_API_KEY` 接入。CLIProxyAPI 的本地端点可设为 `http://127.0.0.1:8317/v1`。
 - **解释性评分**：每只股票都输出分数组成、风险扣分、标签和一段摘要分析
 - **数据新鲜度防线**：评分禁止实时价与陈旧 K 线混算——K 线恰好缺决策当日且实时价昨收口径可对账（偏差 ≤2%）时追加当日实时 bar 统一计算均线/振幅；落后超过容忍交易日窗口或对账失败的标的整只跳过并计入 `meta.skipped_stale`；快照暴露 `meta.realtime_trade_date` / `meta.kline_max_date` / `meta.stale_kline_count`，逐股暴露 `kline_max_date` / `stale_kline` / `realtime_bar_appended` / `amount_base_date`
 - **候选池评价**：`TradingAgents` 返回结果会落到第一池候选池展示，并明确给出 `买入 / 卖出 / 观望` 评价
@@ -326,9 +327,9 @@ Alpha MCP Server（`mcp_server.py`）通过 stdio 协议暴露 16 个工具，�
 | **公告** | `get_notice_funnel` · `get_notice_keywords` · `get_notice_detail` | 公告筛选数据 |
 | **执行** | `get_agent_status` · `list_agent_tasks` · `trigger_notice_screen` | 查询 Agent 状态 / 最近任务 / 主动触发公告筛选 |
 
-### 记忆系统
 Windows 本地可在独立的 Hermes Agent Python 环境中运行 Alpha 的 stdio MCP 服务。Hermes API 默认监听 `127.0.0.1:8642`，Alpha 的 `HERMES_AGENT_URL` 指向 `http://127.0.0.1:8642/v1`，两端使用同一个 `API_SERVER_KEY`。将 Hermes 的模型端点配置为已有的 CLIProxyAPI，可复用 `gpt-6.1-sol`。Alpha MCP 服务使用 `requirements-mcp.txt` 对应的 MCP 2.x 接口。
 
+### 记忆系统
 
 | 层级 | 存储 | 内容 |
 |------|------|------|
@@ -701,6 +702,7 @@ docker compose logs -f  # 查看启动日志
 | `ALPHA_EXTERNAL_BREAKER_THRESHOLD` | `3` | 连续失败达到阈值后打开对应数据源熔断 |
 | `ALPHA_EXTERNAL_BREAKER_COOLDOWN_SECONDS` | `60` | 熔断冷却时间 |
 | `KRONOS_SAMPLE_COUNT` | CPU 50 / GPU 100 | Kronos 推理采样次数；CPU 环境可下调以降低延迟 |
+| `KRONOS_WEIGHTS_DIR` | Hugging Face Hub | 可指定包含 `Kronos-base` 和 `Kronos-Tokenizer-base` 两个目录的本地权重根目录 |
 | `KRONOS_CACHE_TTL_SECONDS` | `900` | Kronos 预测结果缓存有效期 |
 | `KRONOS_CACHE_MAX_ENTRIES` | `128` | Kronos 预测结果 LRU 最大条目数 |
 
@@ -828,9 +830,9 @@ python3 scripts/repair_market_cache.py
 | GET | `/api/kline/{symbol}/moneyflow` | 个股资金流（小/中/大/特大单、净流入及来源） |
 | GET | `/api/kline/{symbol}/minute` | 买入池分钟线（`trade_date`、`limit`） |
 | GET | `/api/market/capital-flow` | 北向资金（沪股通/深股通/北向/南向） |
+| GET | `/api/data/hsgt-top10/{trade_date}` | 沪深股通十大成交股 |
 | GET | `/api/market/index-daily` | 基准指数日线（`ts_code` 默认 `000001.SH`） |
 | POST | `/api/jobs/kline-cache/enrichment-sync` | 手动触发增强数据同步（指定 `trade_date`，同步返回各数据集结果） |
-| GET | `/api/data/hsgt-top10/{trade_date}` | 沪深股通十大成交股 |
 | GET | `/api/jobs/kline-cache/enrichment-status` | 增强数据覆盖状态（最新日期/行数/状态） |
 | POST | `/api/jobs/kline-cache/sync` | 提交全量补缺后台任务（202 Accepted） |
 | POST | `/api/jobs/kline-cache/incremental-sync` | 提交增量同步后台任务（202 Accepted） |

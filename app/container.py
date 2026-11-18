@@ -445,7 +445,7 @@ def build_container(data_dir: str | Path | None = None) -> ServiceContainer:
         kronos_service=kronos_service,
         state_store=funnel_service.state_store,
     )
-    tradingagents_adapter = TradingAgentsAdapter()
+    tradingagents_adapter = TradingAgentsAdapter(runtime_root=directory / "tradingagents_runtime")
     hot_stock_ai_service = HotStockAIService(
         provider=provider,
         kline_store=kline_store,

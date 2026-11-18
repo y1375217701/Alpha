@@ -23,6 +23,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Hashable
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -354,10 +355,23 @@ class KronosPredictService:
     def _load_model():
         from app.services.kronos_model import Kronos, KronosTokenizer, KronosPredictor
 
-        log.info("[kronos] loading tokenizer %s ...", _TOKENIZER_ID)
-        tokenizer = KronosTokenizer.from_pretrained(_TOKENIZER_ID)
-        log.info("[kronos] loading model %s ...", _MODEL_ID)
-        model = Kronos.from_pretrained(_MODEL_ID)
+        weights_dir = os.getenv("KRONOS_WEIGHTS_DIR", "").strip()
+        if weights_dir:
+            root = Path(weights_dir).expanduser().resolve()
+            for model_id in (_TOKENIZER_ID, _MODEL_ID):
+                directory = root / model_id.rsplit("/", 1)[-1]
+                for filename in ("config.json", "model.safetensors"):
+                    if not (directory / filename).is_file():
+                        raise RuntimeError(f"Missing Kronos file: {directory / filename}")
+            tokenizer = KronosTokenizer.from_pretrained(root / "Kronos-Tokenizer-base")
+            model = Kronos.from_pretrained(root / "Kronos-base")
+        else:
+            log.info("[kronos] loading tokenizer %s ...", _TOKENIZER_ID)
+            tokenizer = KronosTokenizer.from_pretrained(_TOKENIZER_ID)
+            log.info("[kronos] loading model %s ...", _MODEL_ID)
+            model = Kronos.from_pretrained(_MODEL_ID)
+        tokenizer.eval()
+        model.eval()
         predictor = KronosPredictor(
             model, tokenizer, device=None, max_context=_MAX_CONTEXT
         )

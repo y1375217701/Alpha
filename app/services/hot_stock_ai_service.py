@@ -24,6 +24,7 @@ from app.services.tradingagents_adapter import (
     DEFAULT_QUICK_MODEL,
     DEEPSEEK_PROVIDER,
     TradingAgentsAdapter,
+    resolve_tradingagents_models,
 )
 
 log = logging.getLogger(__name__)
@@ -146,7 +147,20 @@ class HotStockAIService:
     def get_config(self) -> dict[str, Any]:
         cfg = dict(DEFAULT_CONFIG)
         cfg.update(self._snapshot.get("config", {}))
+        self._resolve_tradingagents_config(cfg)
         return cfg
+
+    @staticmethod
+    def _resolve_tradingagents_config(cfg: dict[str, Any]) -> None:
+        provider, quick, deep = resolve_tradingagents_models(
+            str(cfg.get("tradingagents_quick_model") or ""),
+            str(cfg.get("tradingagents_deep_model") or ""),
+        )
+        cfg.update(
+            tradingagents_provider=provider,
+            tradingagents_quick_model=quick,
+            tradingagents_deep_model=deep,
+        )
 
     def update_config(self, patch: dict[str, Any]) -> dict[str, Any]:
         cfg = self.get_config()
@@ -167,15 +181,14 @@ class HotStockAIService:
         cfg["tradingagents_enabled"] = bool(cfg["tradingagents_enabled"])
         cfg["tradingagents_top_n"] = max(0, min(int(cfg["tradingagents_top_n"]), 20))
         cfg["tradingagents_timeout_seconds"] = max(30, min(int(cfg["tradingagents_timeout_seconds"]), 900))
-        cfg["tradingagents_provider"] = DEEPSEEK_PROVIDER
-        cfg["tradingagents_quick_model"] = str(cfg.get("tradingagents_quick_model") or DEFAULT_QUICK_MODEL).strip() or DEFAULT_QUICK_MODEL
-        cfg["tradingagents_deep_model"] = str(cfg.get("tradingagents_deep_model") or DEFAULT_DEEP_MODEL).strip() or DEFAULT_DEEP_MODEL
+        self._resolve_tradingagents_config(cfg)
         self._snapshot["config"] = cfg
         self._save_state()
         return cfg
 
     def get_snapshot(self) -> dict[str, Any]:
         payload = dict(self._snapshot)
+        payload["config"] = self.get_config()
         payload["progress"] = dict(self.progress)
         payload["running"] = self.running
         return payload
@@ -370,6 +383,8 @@ class HotStockAIService:
             if self.tradingagents is not None and hasattr(self.tradingagents, "describe_runtime")
             else {}
         )
+        ta_provider = cfg["tradingagents_provider"]
+        ta_backend = "DeepSeek" if ta_provider == DEEPSEEK_PROVIDER else cfg["tradingagents_deep_model"]
         self.progress.update(phase="done", current=total, total=total, detail=f"完成分析 {len(entries)} 只")
         return {
             "trade_date": trade_date,
@@ -406,14 +421,16 @@ class HotStockAIService:
                 "tradingagents_discussed": discussion_meta.get("discussed_count", 0),
                 "tradingagents_cache_hits": discussion_meta.get("cache_hits", 0),
                 "tradingagents_failures": discussion_meta.get("failed", 0),
-                "tradingagents_backend": "TradingAgents + DeepSeek" if self.tradingagents is not None else "disabled",
+                "tradingagents_backend": f"TradingAgents + {ta_backend}" if self.tradingagents is not None else "disabled",
                 "tradingagents_repo_path": ta_runtime.get("repo_path", ""),
-                "tradingagents_provider": ta_runtime.get("provider", DEEPSEEK_PROVIDER),
+                "tradingagents_provider": ta_provider,
                 "tradingagents_backend_url": ta_runtime.get("backend_url", ""),
                 "tradingagents_command_example": (
-                    "uv run python -m cli.main analyze "
-                    "--ticker NVDA --date 2026-04-22 --provider deepseek "
-                    "--quick-model deepseek-chat --deep-model deepseek-reasoner"
+                    "uv run --no-sync python path/to/Alpha/app/services/tradingagents_runner.py "
+                    f"--ticker 600519.SS --date 2026-04-22 --provider {ta_provider} "
+                    f"--quick-model {cfg['tradingagents_quick_model']} --deep-model {cfg['tradingagents_deep_model']} "
+                    "--analysts market,news,fundamentals --output-language Chinese "
+                    "--output-file result.json"
                 ),
                 "execution_mode": "light_auto" if trigger == "auto" else "full_manual",
                 "runtime_top_n": int(runtime_cfg["top_n"]),
@@ -484,18 +501,16 @@ class HotStockAIService:
                 continue
 
             try:
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self.tradingagents.analyze,
-                        item["symbol"],
-                        trade_date,
-                        provider=str(cfg["tradingagents_provider"]),
-                        quick_model=str(cfg["tradingagents_quick_model"]),
-                        deep_model=str(cfg["tradingagents_deep_model"]),
-                        selected_analysts=["market", "news", "fundamentals"],
-                        output_language="Chinese",
-                    ),
-                    timeout=float(cfg["tradingagents_timeout_seconds"]),
+                result = await asyncio.to_thread(
+                    self.tradingagents.analyze,
+                    item["symbol"],
+                    trade_date,
+                    provider=str(cfg["tradingagents_provider"]),
+                    quick_model=str(cfg["tradingagents_quick_model"]),
+                    deep_model=str(cfg["tradingagents_deep_model"]),
+                    selected_analysts=["market", "news", "fundamentals"],
+                    output_language="Chinese",
+                    timeout_seconds=float(cfg["tradingagents_timeout_seconds"]),
                 )
                 discussed_count += 1
                 cache[cache_key] = result
