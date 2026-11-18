@@ -602,9 +602,35 @@ def _migrate_market_kline_v3(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_market_kline_v4(conn: sqlite3.Connection) -> None:
+    """#25 市场情绪周期与连板梯队日频表。"""
     conn.execute(
-        "ALTER TABLE moneyflow_daily ADD COLUMN source TEXT NOT NULL DEFAULT 'tushare.moneyflow'"
+        """
+        CREATE TABLE IF NOT EXISTS market_sentiment_daily (
+            trade_date TEXT PRIMARY KEY,
+            sentiment_score REAL,
+            regime TEXT,
+            limit_up_count INTEGER,
+            limit_down_count INTEGER,
+            broken_board_rate REAL,
+            max_board_height INTEGER,
+            first_board_count INTEGER,
+            continuation_count INTEGER,
+            promotion_rate REAL,
+            payload_json TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
     )
+
+
+def _migrate_market_kline_v5(conn: sqlite3.Connection) -> None:
+    # Fork databases used version 4 for moneyflow instead of market sentiment.
+    _migrate_market_kline_v4(conn)
+    columns = {column[1] for column in conn.execute("PRAGMA table_info(moneyflow_daily)")}
+    if "source" not in columns:
+        conn.execute(
+            "ALTER TABLE moneyflow_daily ADD COLUMN source TEXT NOT NULL DEFAULT 'tushare.moneyflow'"
+        )
 
 
 MARKET_KLINE_DB_MIGRATIONS: tuple[Migration, ...] = (
@@ -613,7 +639,8 @@ MARKET_KLINE_DB_MIGRATIONS: tuple[Migration, ...] = (
     ),
     Migration(2, "Tushare enrichment tables", _migrate_market_kline_v2),
     Migration(3, "limit-up board data foundation (#22)", _migrate_market_kline_v3),
-    Migration(4, "daily moneyflow source", _migrate_market_kline_v4),
+    Migration(4, "market sentiment daily (#25)", _migrate_market_kline_v4),
+    Migration(5, "reconcile fork and upstream market schemas", _migrate_market_kline_v5),
 )
 
 
